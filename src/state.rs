@@ -10,9 +10,24 @@
 #![allow(clippy::redundant_closure)]
 
 use crate::config::{load_config, save_config_silent, Settings, TabInfo, ViewMode};
+use crate::ui::TabPipelineState;
+use crate::vcs::GitService;
 use crate::workspaces::{filter_events, AppMode, Workspace, WorkspaceEvent, WorkspaceWatcher};
 use log::{debug, info, warn};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Content Hashing Helper
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Simple hash function for content (for auto-save change detection)
+fn hash_content(content: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    content.hash(&mut hasher);
+    hasher.finish()
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // File Type Detection
@@ -80,6 +95,849 @@ impl FileType {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Multi-Cursor Support
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A selection or cursor position in the editor.
+///
+/// A Selection represents either:
+/// - A cursor with no selection (when `anchor == head`)
+/// - A text selection (when `anchor != head`)
+///
+/// The anchor is the fixed end of the selection (where selection started),
+/// and the head is the moving end (current cursor position).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Selection {
+    /// The fixed end of the selection (where selection started), as a character index.
+    pub anchor: usize,
+    /// The moving end of the selection (current cursor position), as a character index.
+    pub head: usize,
+    /// Preferred visual column for vertical movement (preserved during up/down navigation).
+    /// This is in visual columns, accounting for tabs and wide characters.
+    pub preferred_column: Option<usize>,
+}
+
+impl Selection {
+    /// Create a new cursor with no selection at the given character index.
+    pub fn cursor(pos: usize) -> Self {
+        Self {
+            anchor: pos,
+            head: pos,
+            preferred_column: None,
+        }
+    }
+
+    /// Create a new selection from anchor to head.
+    pub fn new(anchor: usize, head: usize) -> Self {
+        Self {
+            anchor,
+            head,
+            preferred_column: None,
+        }
+    }
+
+    /// Check if this is a cursor with no selection.
+    pub fn is_cursor(&self) -> bool {
+        self.anchor == self.head
+    }
+
+    /// Check if this is a selection (has a range).
+    pub fn is_selection(&self) -> bool {
+        self.anchor != self.head
+    }
+
+    /// Get the start of the selection (smaller index).
+    pub fn start(&self) -> usize {
+        self.anchor.min(self.head)
+    }
+
+    /// Get the end of the selection (larger index).
+    pub fn end(&self) -> usize {
+        self.anchor.max(self.head)
+    }
+
+    /// Get the selection range as (start, end) tuple.
+    pub fn range(&self) -> (usize, usize) {
+        (self.start(), self.end())
+    }
+
+    /// Get the length of the selection.
+    pub fn len(&self) -> usize {
+        self.end() - self.start()
+    }
+
+    /// Check if the selection is empty (cursor with no selection).
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Check if this selection contains or overlaps with a position.
+    pub fn contains(&self, pos: usize) -> bool {
+        pos >= self.start() && pos <= self.end()
+    }
+
+    /// Check if this selection overlaps with another selection.
+    pub fn overlaps(&self, other: &Selection) -> bool {
+        self.start() < other.end() && other.start() < self.end()
+    }
+
+    /// Merge this selection with another overlapping selection.
+    pub fn merge(&self, other: &Selection) -> Selection {
+        Selection {
+            anchor: self.start().min(other.start()),
+            head: self.end().max(other.end()),
+            preferred_column: self.preferred_column.or(other.preferred_column),
+        }
+    }
+
+    /// Move the cursor/selection by an offset.
+    pub fn offset(self, delta: isize) -> Selection {
+        let new_anchor = (self.anchor as isize + delta).max(0) as usize;
+        let new_head = (self.head as isize + delta).max(0) as usize;
+        Selection {
+            anchor: new_anchor,
+            head: new_head,
+            preferred_column: self.preferred_column,
+        }
+    }
+
+    /// Collapse the selection to a cursor at the head position.
+    pub fn collapse_to_head(self) -> Selection {
+        Selection::cursor(self.head)
+    }
+
+    /// Collapse the selection to a cursor at the start position.
+    pub fn collapse_to_start(self) -> Selection {
+        Selection::cursor(self.start())
+    }
+
+    /// Collapse the selection to a cursor at the end position.
+    pub fn collapse_to_end(self) -> Selection {
+        Selection::cursor(self.end())
+    }
+}
+
+impl Default for Selection {
+    fn default() -> Self {
+        Self::cursor(0)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Transient Highlight (Search Result Navigation)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A temporary highlight for search result navigation.
+///
+/// This highlight is applied when the user clicks a search-in-files result,
+/// and is automatically cleared on scroll, edit, or any mouse click.
+/// It is independent of text selection and multi-cursor state.
+#[derive(Debug, Clone, Default)]
+pub struct TransientHighlight {
+    /// The character range to highlight (start, end).
+    /// None if no highlight is active.
+    range: Option<(usize, usize)>,
+    /// Guard flag to ignore the programmatic scroll that positions the match.
+    /// Set to true when the highlight is first applied, cleared after one scroll event.
+    ignore_next_scroll: bool,
+}
+
+impl TransientHighlight {
+    /// Create a new transient highlight (initially inactive).
+    pub fn new() -> Self {
+        Self {
+            range: None,
+            ignore_next_scroll: false,
+        }
+    }
+
+    /// Set the highlight range.
+    ///
+    /// This also sets the guard flag to ignore the programmatic scroll.
+    pub fn set(&mut self, start: usize, end: usize) {
+        self.range = Some((start, end));
+        self.ignore_next_scroll = true;
+    }
+
+    /// Clear the highlight.
+    pub fn clear(&mut self) {
+        self.range = None;
+        self.ignore_next_scroll = false;
+    }
+
+    /// Check if a highlight is active.
+    pub fn is_active(&self) -> bool {
+        self.range.is_some()
+    }
+
+    /// Get the highlight range if active.
+    pub fn range(&self) -> Option<(usize, usize)> {
+        self.range
+    }
+
+    /// Handle a scroll event.
+    ///
+    /// If this is the first scroll after applying the highlight (the programmatic
+    /// scroll to position the match), ignore it. Otherwise, clear the highlight.
+    ///
+    /// Returns true if the highlight was cleared.
+    pub fn on_scroll(&mut self) -> bool {
+        if self.range.is_none() {
+            return false;
+        }
+
+        if self.ignore_next_scroll {
+            self.ignore_next_scroll = false;
+            return false;
+        }
+
+        self.clear();
+        true
+    }
+
+    /// Handle an edit event. Clears the highlight.
+    ///
+    /// Returns true if the highlight was cleared.
+    pub fn on_edit(&mut self) -> bool {
+        if self.range.is_some() {
+            self.clear();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Handle a mouse click event. Clears the highlight.
+    ///
+    /// Returns true if the highlight was cleared.
+    pub fn on_click(&mut self) -> bool {
+        if self.range.is_some() {
+            self.clear();
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Multi-cursor state - a collection of selections/cursors.
+///
+/// Invariants:
+/// - Always contains at least one selection
+/// - Selections are sorted by start position
+/// - Selections do not overlap (merged if they would)
+#[derive(Debug, Clone, Default)]
+pub struct MultiCursor {
+    /// All active selections/cursors (sorted, non-overlapping).
+    selections: Vec<Selection>,
+    /// Index of the primary selection (for status bar display, scroll anchoring).
+    primary_index: usize,
+}
+
+impl MultiCursor {
+    /// Create a new multi-cursor with a single cursor at position 0.
+    pub fn new() -> Self {
+        Self {
+            selections: vec![Selection::cursor(0)],
+            primary_index: 0,
+        }
+    }
+
+    /// Create a multi-cursor with a single cursor at the given position.
+    pub fn single(pos: usize) -> Self {
+        Self {
+            selections: vec![Selection::cursor(pos)],
+            primary_index: 0,
+        }
+    }
+
+    /// Create a multi-cursor with a single selection.
+    pub fn from_selection(selection: Selection) -> Self {
+        Self {
+            selections: vec![selection],
+            primary_index: 0,
+        }
+    }
+
+    /// Get all selections.
+    pub fn selections(&self) -> &[Selection] {
+        &self.selections
+    }
+
+    /// Get the number of cursors/selections.
+    pub fn len(&self) -> usize {
+        self.selections.len()
+    }
+
+    /// Check if there's only a single cursor/selection.
+    pub fn is_single(&self) -> bool {
+        self.selections.len() == 1
+    }
+
+    /// Check if this is empty (should never be true due to invariants).
+    pub fn is_empty(&self) -> bool {
+        self.selections.is_empty()
+    }
+
+    /// Get the primary selection (for status bar, scroll anchoring).
+    pub fn primary(&self) -> &Selection {
+        self.selections
+            .get(self.primary_index)
+            .unwrap_or(&self.selections[0])
+    }
+
+    /// Get a mutable reference to the primary selection.
+    pub fn primary_mut(&mut self) -> &mut Selection {
+        let idx = self.primary_index.min(self.selections.len().saturating_sub(1));
+        &mut self.selections[idx]
+    }
+
+    /// Get the primary index.
+    pub fn primary_index(&self) -> usize {
+        self.primary_index
+    }
+
+    /// Set the primary selection by index.
+    pub fn set_primary(&mut self, index: usize) {
+        if index < self.selections.len() {
+            self.primary_index = index;
+        }
+    }
+
+    /// Add a new selection, maintaining invariants.
+    pub fn add(&mut self, selection: Selection) {
+        self.selections.push(selection);
+        self.normalize();
+    }
+
+    /// Replace all selections with a single one.
+    pub fn set_single(&mut self, selection: Selection) {
+        self.selections.clear();
+        self.selections.push(selection);
+        self.primary_index = 0;
+    }
+
+    /// Clear to a single cursor at position 0.
+    pub fn clear(&mut self) {
+        self.selections.clear();
+        self.selections.push(Selection::cursor(0));
+        self.primary_index = 0;
+    }
+
+    /// Normalize selections: sort and merge overlapping.
+    fn normalize(&mut self) {
+        if self.selections.is_empty() {
+            self.selections.push(Selection::cursor(0));
+            self.primary_index = 0;
+            return;
+        }
+
+        // Sort by start position
+        self.selections.sort_by_key(|s| s.start());
+
+        // Merge overlapping selections
+        let mut merged: Vec<Selection> = Vec::with_capacity(self.selections.len());
+        for sel in self.selections.drain(..) {
+            if let Some(last) = merged.last_mut() {
+                if last.overlaps(&sel) || last.end() == sel.start() {
+                    *last = last.merge(&sel);
+                    continue;
+                }
+            }
+            merged.push(sel);
+        }
+
+        self.selections = merged;
+
+        // Ensure primary_index is valid
+        if self.primary_index >= self.selections.len() {
+            self.primary_index = self.selections.len().saturating_sub(1);
+        }
+    }
+
+    /// Apply an offset adjustment to all selections after a given position.
+    /// Used after insertions/deletions to keep cursor positions valid.
+    pub fn adjust_after(&mut self, pos: usize, delta: isize) {
+        for sel in &mut self.selections {
+            if sel.anchor >= pos {
+                sel.anchor = (sel.anchor as isize + delta).max(0) as usize;
+            }
+            if sel.head >= pos {
+                sel.head = (sel.head as isize + delta).max(0) as usize;
+            }
+        }
+        self.normalize();
+    }
+
+    /// Get legacy cursor position (line, column) from primary selection.
+    /// Used for backwards compatibility with status bar, etc.
+    pub fn cursor_position(&self, text: &str) -> (usize, usize) {
+        let pos = self.primary().head;
+        char_index_to_line_col(text, pos)
+    }
+
+    /// Get legacy selection range from primary selection.
+    /// Returns None if primary is a cursor with no selection.
+    pub fn selection_range(&self) -> Option<(usize, usize)> {
+        let primary = self.primary();
+        if primary.is_selection() {
+            Some(primary.range())
+        } else {
+            None
+        }
+    }
+
+    /// Iterate over all selections.
+    pub fn iter(&self) -> impl Iterator<Item = &Selection> {
+        self.selections.iter()
+    }
+
+    /// Iterate mutably over all selections.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Selection> {
+        self.selections.iter_mut()
+    }
+}
+
+/// Convert character index to (line, column) position.
+/// Both line and column are 0-indexed.
+fn char_index_to_line_col(text: &str, char_index: usize) -> (usize, usize) {
+    let mut line = 0;
+    let mut col = 0;
+
+    for (i, ch) in text.chars().enumerate() {
+        if i >= char_index {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+    }
+
+    (line, col)
+}
+
+/// Convert (line, column) position to character index.
+/// Both line and column are 0-indexed.
+/// Returns the closest valid index if position is out of bounds.
+fn line_col_to_char_index(text: &str, line: usize, col: usize) -> usize {
+    let mut current_line = 0;
+    let mut current_col = 0;
+
+    for (i, ch) in text.chars().enumerate() {
+        if current_line == line && current_col == col {
+            return i;
+        }
+        if ch == '\n' {
+            if current_line == line {
+                // Reached end of target line before reaching column
+                return i;
+            }
+            current_line += 1;
+            current_col = 0;
+        } else if current_line == line {
+            current_col += 1;
+        }
+    }
+
+    // Return end of text if position is beyond
+    text.chars().count()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Code Folding
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The kind/type of a foldable region.
+///
+/// Different fold kinds have different detection rules and may be
+/// toggled on/off independently in settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FoldKind {
+    /// Markdown heading (## Section) - folds until next heading of same/higher level
+    Heading(u8), // level 1-6
+    /// Fenced code block (```...```)
+    CodeBlock,
+    /// List hierarchy (nested list items)
+    List,
+    /// Indentation-based region (for JSON/YAML/structured files)
+    Indentation,
+}
+
+impl FoldKind {
+    /// Get a display name for this fold kind.
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            FoldKind::Heading(_) => "Heading",
+            FoldKind::CodeBlock => "Code Block",
+            FoldKind::List => "List",
+            FoldKind::Indentation => "Indentation",
+        }
+    }
+
+    /// Get an icon for this fold kind.
+    pub fn icon(&self) -> &'static str {
+        match self {
+            FoldKind::Heading(_) => "§",
+            FoldKind::CodeBlock => "{ }",
+            FoldKind::List => "•",
+            FoldKind::Indentation => "⤵",
+        }
+    }
+}
+
+/// A unique identifier for a fold region.
+pub type FoldId = u32;
+
+/// A foldable region in a document.
+///
+/// Represents a contiguous range of lines that can be collapsed/expanded.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FoldRegion {
+    /// Unique identifier for this fold region
+    pub id: FoldId,
+    /// Starting line (0-indexed, inclusive)
+    pub start_line: usize,
+    /// Ending line (0-indexed, inclusive)
+    pub end_line: usize,
+    /// The kind of fold region
+    pub kind: FoldKind,
+    /// Whether this region is currently collapsed
+    pub collapsed: bool,
+    /// Preview text to show when collapsed (e.g., first line content)
+    pub preview_text: String,
+}
+
+impl FoldRegion {
+    /// Create a new fold region.
+    pub fn new(id: FoldId, start_line: usize, end_line: usize, kind: FoldKind) -> Self {
+        Self {
+            id,
+            start_line,
+            end_line,
+            kind,
+            collapsed: false,
+            preview_text: String::new(),
+        }
+    }
+
+    /// Create a new fold region with preview text.
+    pub fn with_preview(
+        id: FoldId,
+        start_line: usize,
+        end_line: usize,
+        kind: FoldKind,
+        preview: String,
+    ) -> Self {
+        Self {
+            id,
+            start_line,
+            end_line,
+            kind,
+            collapsed: false,
+            preview_text: preview,
+        }
+    }
+
+    /// Get the number of lines in this fold region.
+    pub fn line_count(&self) -> usize {
+        self.end_line.saturating_sub(self.start_line) + 1
+    }
+
+    /// Get the number of hidden lines when collapsed.
+    pub fn hidden_line_count(&self) -> usize {
+        if self.collapsed {
+            self.end_line.saturating_sub(self.start_line)
+        } else {
+            0
+        }
+    }
+
+    /// Check if a line is within this fold region.
+    pub fn contains_line(&self, line: usize) -> bool {
+        line >= self.start_line && line <= self.end_line
+    }
+
+    /// Check if a line is hidden by this fold (collapsed and not the start line).
+    pub fn hides_line(&self, line: usize) -> bool {
+        self.collapsed && line > self.start_line && line <= self.end_line
+    }
+
+    /// Toggle the collapsed state.
+    pub fn toggle(&mut self) {
+        self.collapsed = !self.collapsed;
+    }
+
+    /// Adjust line numbers after an edit.
+    ///
+    /// `edit_line` is where the edit occurred, `delta` is the number of lines added (positive)
+    /// or removed (negative).
+    ///
+    /// Returns `true` if the region is still valid, `false` if it should be removed.
+    pub fn adjust_for_edit(&mut self, edit_line: usize, delta: isize) -> bool {
+        // If edit is after this region, no change needed
+        if edit_line > self.end_line {
+            return true;
+        }
+
+        // If edit is within the region, adjust end line
+        if edit_line >= self.start_line && edit_line <= self.end_line {
+            let new_end = self.end_line as isize + delta;
+            if new_end < self.start_line as isize {
+                // Region collapsed to invalid state
+                return false;
+            }
+            self.end_line = new_end as usize;
+            return true;
+        }
+
+        // Edit is before this region, shift both lines
+        let new_start = self.start_line as isize + delta;
+        let new_end = self.end_line as isize + delta;
+
+        if new_start < 0 || new_end < new_start {
+            return false;
+        }
+
+        self.start_line = new_start as usize;
+        self.end_line = new_end as usize;
+        true
+    }
+}
+
+/// State manager for all fold regions in a document.
+///
+/// Maintains an ordered list of fold regions and provides efficient
+/// queries for rendering and interaction.
+#[derive(Debug, Clone, Default)]
+pub struct FoldState {
+    /// All fold regions, sorted by start_line
+    regions: Vec<FoldRegion>,
+    /// Counter for generating unique fold IDs
+    next_id: FoldId,
+    /// Whether fold state needs recomputation
+    dirty: bool,
+}
+
+impl FoldState {
+    /// Create a new empty fold state.
+    pub fn new() -> Self {
+        Self {
+            regions: Vec::new(),
+            next_id: 1,
+            dirty: true,
+        }
+    }
+
+    /// Get all fold regions.
+    pub fn regions(&self) -> &[FoldRegion] {
+        &self.regions
+    }
+
+    /// Get mutable access to all fold regions.
+    pub fn regions_mut(&mut self) -> &mut Vec<FoldRegion> {
+        &mut self.regions
+    }
+
+    /// Check if there are any fold regions.
+    pub fn is_empty(&self) -> bool {
+        self.regions.is_empty()
+    }
+
+    /// Get the number of fold regions.
+    pub fn len(&self) -> usize {
+        self.regions.len()
+    }
+
+    /// Check if fold state needs recomputation.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Mark fold state as needing recomputation.
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    /// Mark fold state as clean (just recomputed).
+    pub fn mark_clean(&mut self) {
+        self.dirty = false;
+    }
+
+    /// Generate a new unique fold ID.
+    pub fn next_id(&mut self) -> FoldId {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        id
+    }
+
+    /// Clear all fold regions.
+    pub fn clear(&mut self) {
+        self.regions.clear();
+        self.dirty = true;
+    }
+
+    /// Replace all fold regions with new ones.
+    pub fn set_regions(&mut self, regions: Vec<FoldRegion>) {
+        self.regions = regions;
+        self.sort_regions();
+        self.dirty = false;
+    }
+
+    /// Add a fold region, maintaining sort order.
+    pub fn add_region(&mut self, region: FoldRegion) {
+        self.regions.push(region);
+        self.sort_regions();
+    }
+
+    /// Sort regions by start line.
+    fn sort_regions(&mut self) {
+        self.regions.sort_by_key(|r| r.start_line);
+    }
+
+    /// Get the fold region that starts on a given line.
+    pub fn region_at_line(&self, line: usize) -> Option<&FoldRegion> {
+        self.regions.iter().find(|r| r.start_line == line)
+    }
+
+    /// Get mutable access to the fold region that starts on a given line.
+    pub fn region_at_line_mut(&mut self, line: usize) -> Option<&mut FoldRegion> {
+        self.regions.iter_mut().find(|r| r.start_line == line)
+    }
+
+    /// Get the fold region by ID.
+    pub fn region_by_id(&self, id: FoldId) -> Option<&FoldRegion> {
+        self.regions.iter().find(|r| r.id == id)
+    }
+
+    /// Get mutable access to a fold region by ID.
+    pub fn region_by_id_mut(&mut self, id: FoldId) -> Option<&mut FoldRegion> {
+        self.regions.iter_mut().find(|r| r.id == id)
+    }
+
+    /// Toggle the fold state at a given line.
+    ///
+    /// Returns `true` if a fold was toggled.
+    pub fn toggle_at_line(&mut self, line: usize) -> bool {
+        if let Some(region) = self.region_at_line_mut(line) {
+            region.toggle();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Check if a line is hidden by any collapsed fold.
+    pub fn is_line_hidden(&self, line: usize) -> bool {
+        self.regions.iter().any(|r| r.hides_line(line))
+    }
+
+    /// Get the fold region that hides a given line.
+    pub fn fold_hiding_line(&self, line: usize) -> Option<&FoldRegion> {
+        self.regions.iter().find(|r| r.hides_line(line))
+    }
+
+    /// Expand any fold that contains the given line (to reveal it).
+    ///
+    /// Returns `true` if any fold was expanded.
+    pub fn reveal_line(&mut self, line: usize) -> bool {
+        let mut revealed = false;
+        for region in &mut self.regions {
+            if region.hides_line(line) {
+                region.collapsed = false;
+                revealed = true;
+            }
+        }
+        revealed
+    }
+
+    /// Fold all regions of a specific kind.
+    pub fn fold_all_of_kind(&mut self, kind_matches: impl Fn(&FoldKind) -> bool) {
+        for region in &mut self.regions {
+            if kind_matches(&region.kind) {
+                region.collapsed = true;
+            }
+        }
+    }
+
+    /// Unfold all regions.
+    pub fn unfold_all(&mut self) {
+        for region in &mut self.regions {
+            region.collapsed = false;
+        }
+    }
+
+    /// Fold all regions.
+    pub fn fold_all(&mut self) {
+        for region in &mut self.regions {
+            region.collapsed = true;
+        }
+    }
+
+    /// Get the total number of hidden lines.
+    pub fn hidden_line_count(&self) -> usize {
+        self.regions.iter().map(|r| r.hidden_line_count()).sum()
+    }
+
+    /// Get all lines that have fold indicators (start lines of regions).
+    pub fn fold_indicator_lines(&self) -> Vec<(usize, bool)> {
+        self.regions
+            .iter()
+            .map(|r| (r.start_line, r.collapsed))
+            .collect()
+    }
+
+    /// Map a visual line (accounting for folds) to the actual document line.
+    ///
+    /// Visual lines skip over hidden (folded) content.
+    pub fn visual_to_document_line(&self, visual_line: usize) -> usize {
+        let mut doc_line = 0;
+        let mut vis_line = 0;
+
+        while vis_line < visual_line {
+            if !self.is_line_hidden(doc_line) {
+                vis_line += 1;
+            }
+            doc_line += 1;
+        }
+
+        // Skip any hidden lines at the target position
+        while self.is_line_hidden(doc_line) {
+            doc_line += 1;
+        }
+
+        doc_line
+    }
+
+    /// Map a document line to the visual line (accounting for folds).
+    pub fn document_to_visual_line(&self, doc_line: usize) -> usize {
+        let mut vis_line = 0;
+        for line in 0..doc_line {
+            if !self.is_line_hidden(line) {
+                vis_line += 1;
+            }
+        }
+        vis_line
+    }
+
+    /// Adjust all fold regions after a document edit.
+    ///
+    /// `edit_line` is where the edit occurred, `delta` is the number of lines
+    /// added (positive) or removed (negative).
+    pub fn adjust_for_edit(&mut self, edit_line: usize, delta: isize) {
+        self.regions.retain_mut(|r| r.adjust_for_edit(edit_line, delta));
+        self.dirty = true;
+    }
+
+    /// Get the number of collapsed folds.
+    pub fn collapsed_count(&self) -> usize {
+        self.regions.iter().filter(|r| r.collapsed).count()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tab State (Runtime)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -98,12 +956,31 @@ pub struct Tab {
     pub content: String,
     /// Original content (for detecting modifications)
     original_content: String,
-    /// Cursor position (line, column) - 0-indexed
+    /// Multi-cursor state (supports multiple selections/cursors)
+    pub cursors: MultiCursor,
+    /// Legacy: Cursor position (line, column) - 0-indexed. 
+    /// Computed from primary cursor, kept for backwards compatibility.
     pub cursor_position: (usize, usize),
-    /// Text selection range (start_char_index, end_char_index) - None if no selection
+    /// Legacy: Text selection range (start_char_index, end_char_index) - None if no selection.
+    /// Computed from primary cursor, kept for backwards compatibility.
     pub selection: Option<(usize, usize)>,
     /// Scroll offset in the editor
     pub scroll_offset: f32,
+    /// Total content height inside the scroll area (for sync scrolling)
+    pub content_height: f32,
+    /// Viewport height of the scroll area (for sync scrolling)
+    pub viewport_height: f32,
+    /// Pending scroll offset to apply on next render (for sync scrolling on mode switch)
+    pub pending_scroll_offset: Option<f32>,
+    /// Pending scroll ratio to apply (0.0 to 1.0) - used when content_height is unknown
+    pub pending_scroll_ratio: Option<f32>,
+    /// Line-to-Y mappings from last rendered mode render (for scroll sync)
+    /// Vec of (start_line, end_line, rendered_y)
+    pub rendered_line_mappings: Vec<(usize, usize, f32)>,
+    /// Actual line height in Raw mode (for accurate scroll sync)
+    pub raw_line_height: f32,
+    /// Pending target line to scroll to (for sync scrolling, used with line mappings)
+    pub pending_scroll_to_line: Option<usize>,
     /// View mode for this tab (raw or rendered)
     pub view_mode: ViewMode,
     /// Undo history stack
@@ -119,6 +996,21 @@ pub struct Tab {
     file_type: FileType,
     /// Whether the editor should request focus on next frame
     pub needs_focus: bool,
+    /// Transient highlight for search result navigation (not persisted).
+    pub transient_highlight: TransientHighlight,
+    /// Whether auto-save is enabled for this tab (per-tab toggle)
+    pub auto_save_enabled: bool,
+    /// Time of last content edit (for idle-based auto-save scheduling)
+    pub last_edit_time: Option<std::time::Instant>,
+    /// Hash of content at last auto-save (to detect if content needs saving)
+    last_auto_save_content_hash: Option<u64>,
+    /// Fold state for code folding
+    pub fold_state: FoldState,
+    /// Split view ratio (0.0 to 1.0, proportion of width for left pane)
+    /// Default is 0.5 (50/50 split). Only used when view_mode is Split.
+    pub split_ratio: f32,
+    /// Live Pipeline state for this tab (JSON/YAML command piping)
+    pub pipeline_state: TabPipelineState,
 }
 
 impl Tab {
@@ -132,9 +1024,17 @@ impl Tab {
             path: None,
             content: String::new(),
             original_content: String::new(),
+            cursors: MultiCursor::new(),
             cursor_position: (0, 0),
             selection: None,
             scroll_offset: 0.0,
+            content_height: 0.0,
+            viewport_height: 0.0,
+            pending_scroll_offset: None,
+            pending_scroll_ratio: None,
+            rendered_line_mappings: Vec::new(),
+            raw_line_height: 20.0, // Default, updated on first render
+            pending_scroll_to_line: None,
             view_mode: ViewMode::Raw, // New documents default to raw mode
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -142,7 +1042,21 @@ impl Tab {
             content_version: 0,
             file_type: FileType::Markdown, // New tabs default to markdown
             needs_focus: true, // Auto-focus new tabs
+            transient_highlight: TransientHighlight::new(),
+            auto_save_enabled: false, // Will be set from settings by caller
+            last_edit_time: None,
+            last_auto_save_content_hash: None,
+            fold_state: FoldState::new(),
+            split_ratio: 0.5, // Default to 50/50 split
+            pipeline_state: TabPipelineState::default(),
         }
+    }
+
+    /// Create a new empty tab with settings-based auto-save default.
+    pub fn new_with_settings(id: usize, auto_save_default: bool) -> Self {
+        let mut tab = Self::new(id);
+        tab.auto_save_enabled = auto_save_default;
+        tab
     }
 
     /// Create a tab with content from a file.
@@ -157,9 +1071,17 @@ impl Tab {
             path: Some(path),
             content: content.clone(),
             original_content: content,
+            cursors: MultiCursor::new(),
             cursor_position: (0, 0),
             selection: None,
             scroll_offset: 0.0,
+            content_height: 0.0,
+            viewport_height: 0.0,
+            pending_scroll_offset: None,
+            pending_scroll_ratio: None,
+            rendered_line_mappings: Vec::new(),
+            raw_line_height: 20.0, // Default, updated on first render
+            pending_scroll_to_line: None,
             view_mode: ViewMode::Raw, // Newly opened files default to raw mode
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -167,12 +1089,26 @@ impl Tab {
             content_version: 0,
             file_type,
             needs_focus: true, // Auto-focus newly opened files
+            transient_highlight: TransientHighlight::new(),
+            auto_save_enabled: false, // Will be set from settings by caller
+            last_edit_time: None,
+            last_auto_save_content_hash: None,
+            fold_state: FoldState::new(),
+            split_ratio: 0.5, // Default to 50/50 split
+            pipeline_state: TabPipelineState::default(),
         }
+    }
+
+    /// Create a tab with content from a file, with settings-based auto-save.
+    pub fn with_file_and_settings(id: usize, path: PathBuf, content: String, auto_save_default: bool) -> Self {
+        let mut tab = Self::with_file(id, path, content);
+        tab.auto_save_enabled = auto_save_default;
+        tab
     }
 
     /// Create a tab from saved session info.
     ///
-    /// Restores the view mode from the saved session.
+    /// Restores the view mode and split ratio from the saved session.
     /// File type is detected from the path extension.
     /// Restored tabs don't auto-focus since we're restoring previous state.
     pub fn from_tab_info(id: usize, info: &TabInfo, content: String) -> Self {
@@ -181,14 +1117,24 @@ impl Tab {
             .as_ref()
             .map(|p| FileType::from_path(p))
             .unwrap_or(FileType::Markdown);
+        // Convert legacy cursor position to char index for MultiCursor
+        let cursor_char_idx = line_col_to_char_index(&content, info.cursor_position.0, info.cursor_position.1);
         Self {
             id,
             path: info.path.clone(),
             content: content.clone(),
             original_content: content,
+            cursors: MultiCursor::single(cursor_char_idx),
             cursor_position: info.cursor_position,
             selection: None,
             scroll_offset: info.scroll_offset,
+            content_height: 0.0,
+            viewport_height: 0.0,
+            pending_scroll_offset: None,
+            pending_scroll_ratio: None,
+            rendered_line_mappings: Vec::new(),
+            raw_line_height: 20.0, // Default, updated on first render
+            pending_scroll_to_line: None,
             view_mode: info.view_mode, // Restore saved view mode
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -196,7 +1142,21 @@ impl Tab {
             content_version: 0,
             file_type,
             needs_focus: false, // Don't auto-focus restored tabs
+            transient_highlight: TransientHighlight::new(),
+            auto_save_enabled: false, // Will be set from settings by caller
+            last_edit_time: None,
+            last_auto_save_content_hash: None,
+            fold_state: FoldState::new(),
+            split_ratio: info.split_ratio, // Restore saved split ratio
+            pipeline_state: TabPipelineState::default(),
         }
+    }
+
+    /// Create a tab from session info with settings-based auto-save.
+    pub fn from_tab_info_with_settings(id: usize, info: &TabInfo, content: String, auto_save_default: bool) -> Self {
+        let mut tab = Self::from_tab_info(id, info, content);
+        tab.auto_save_enabled = auto_save_default;
+        tab
     }
 
     /// Check if the tab has unsaved changes.
@@ -221,8 +1181,71 @@ impl Tab {
     }
 
     /// Mark the current content as saved (updates original_content).
+    /// Also clears auto-save state since content is now persisted.
     pub fn mark_saved(&mut self) {
         self.original_content = self.content.clone();
+        // Clear auto-save tracking since content is now saved
+        self.last_auto_save_content_hash = None;
+        self.last_edit_time = None;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Auto-Save Methods
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Toggle auto-save for this tab.
+    pub fn toggle_auto_save(&mut self) {
+        self.auto_save_enabled = !self.auto_save_enabled;
+        if !self.auto_save_enabled {
+            // Clear auto-save tracking when disabled
+            self.last_edit_time = None;
+        }
+    }
+
+    /// Mark that content was edited (updates last_edit_time for auto-save scheduling).
+    pub fn mark_content_edited(&mut self) {
+        if self.auto_save_enabled {
+            self.last_edit_time = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Check if auto-save should trigger based on idle time.
+    ///
+    /// Returns true if:
+    /// - Auto-save is enabled for this tab
+    /// - Tab has unsaved changes (modified)
+    /// - Content has changed since last auto-save
+    /// - Idle delay has passed since last edit
+    pub fn should_auto_save(&self, delay_ms: u32) -> bool {
+        if !self.auto_save_enabled || !self.is_modified() {
+            return false;
+        }
+
+        // Check if content changed since last auto-save
+        let current_hash = hash_content(&self.content);
+        if let Some(last_hash) = self.last_auto_save_content_hash {
+            if current_hash == last_hash {
+                return false; // No changes since last auto-save
+            }
+        }
+
+        // Check if idle delay has passed
+        if let Some(last_edit) = self.last_edit_time {
+            let elapsed = last_edit.elapsed();
+            elapsed >= std::time::Duration::from_millis(delay_ms as u64)
+        } else {
+            false
+        }
+    }
+
+    /// Mark that auto-save was performed (updates content hash).
+    pub fn mark_auto_saved(&mut self) {
+        self.last_auto_save_content_hash = Some(hash_content(&self.content));
+    }
+
+    /// Get the content hash for change detection.
+    pub fn content_hash(&self) -> u64 {
+        hash_content(&self.content)
     }
 
     /// Set new content and push current to undo stack.
@@ -236,6 +1259,8 @@ impl Tab {
             // Clear redo stack on new edit
             self.redo_stack.clear();
             self.content = new_content;
+            // Update last edit time for auto-save
+            self.mark_content_edited();
         }
     }
 
@@ -327,6 +1352,7 @@ impl Tab {
             cursor_position: self.cursor_position,
             scroll_offset: self.scroll_offset,
             view_mode: self.view_mode,
+            split_ratio: self.split_ratio,
         }
     }
 
@@ -340,10 +1366,50 @@ impl Tab {
         self.view_mode = mode;
     }
 
-    /// Toggle the view mode between Raw and Rendered.
+    /// Toggle the view mode: Raw → Split → Rendered → Raw
     pub fn toggle_view_mode(&mut self) -> ViewMode {
         self.view_mode = self.view_mode.toggle();
         self.view_mode
+    }
+
+    /// Get the split view ratio for this tab.
+    pub fn get_split_ratio(&self) -> f32 {
+        self.split_ratio
+    }
+
+    /// Set the split view ratio for this tab.
+    /// The ratio is clamped to a valid range (0.2 to 0.8).
+    pub fn set_split_ratio(&mut self, ratio: f32) {
+        self.split_ratio = ratio.clamp(0.2, 0.8);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Live Pipeline Support
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Check if pipeline panel is visible for this tab.
+    pub fn pipeline_visible(&self) -> bool {
+        self.pipeline_state.panel_visible
+    }
+
+    /// Toggle the pipeline panel visibility.
+    pub fn toggle_pipeline_panel(&mut self) {
+        self.pipeline_state.panel_visible = !self.pipeline_state.panel_visible;
+    }
+
+    /// Show the pipeline panel.
+    pub fn show_pipeline_panel(&mut self) {
+        self.pipeline_state.panel_visible = true;
+    }
+
+    /// Hide the pipeline panel.
+    pub fn hide_pipeline_panel(&mut self) {
+        self.pipeline_state.panel_visible = false;
+    }
+
+    /// Check if this tab's file type supports pipeline (JSON/YAML).
+    pub fn supports_pipeline(&self) -> bool {
+        matches!(self.file_type, FileType::Json | FileType::Yaml)
     }
 
     /// Get the file type for this tab.
@@ -361,6 +1427,360 @@ impl Tab {
     pub fn set_path(&mut self, path: PathBuf) {
         self.file_type = FileType::from_path(&path);
         self.path = Some(path);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Multi-Cursor Support
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Sync legacy cursor_position and selection fields from the primary cursor.
+    ///
+    /// Call this after modifying the cursors to keep backwards compatibility
+    /// with code that uses the legacy fields.
+    pub fn sync_cursor_from_primary(&mut self) {
+        self.cursor_position = self.cursors.cursor_position(&self.content);
+        self.selection = self.cursors.selection_range();
+    }
+
+    /// Check if multi-cursor mode is active (more than one cursor).
+    pub fn has_multiple_cursors(&self) -> bool {
+        !self.cursors.is_single()
+    }
+
+    /// Get the number of active cursors.
+    pub fn cursor_count(&self) -> usize {
+        self.cursors.len()
+    }
+
+    /// Clear all cursors and reset to a single cursor at the given position.
+    pub fn clear_to_single_cursor(&mut self, pos: usize) {
+        self.cursors.set_single(Selection::cursor(pos));
+        self.sync_cursor_from_primary();
+    }
+
+    /// Clear all cursors and reset to a single cursor at the primary position.
+    pub fn exit_multi_cursor_mode(&mut self) {
+        let primary_pos = self.cursors.primary().head;
+        self.clear_to_single_cursor(primary_pos);
+    }
+
+    /// Add a new cursor at the given character position.
+    pub fn add_cursor(&mut self, pos: usize) {
+        self.cursors.add(Selection::cursor(pos));
+        self.sync_cursor_from_primary();
+    }
+
+    /// Add a new selection (for Ctrl+D next occurrence).
+    pub fn add_selection(&mut self, anchor: usize, head: usize) {
+        self.cursors.add(Selection::new(anchor, head));
+        self.sync_cursor_from_primary();
+    }
+
+    /// Set the primary cursor/selection (for single cursor operations).
+    pub fn set_cursor(&mut self, pos: usize) {
+        self.cursors.set_single(Selection::cursor(pos));
+        self.sync_cursor_from_primary();
+    }
+
+    /// Set the primary selection (for single selection operations).
+    pub fn set_selection(&mut self, anchor: usize, head: usize) {
+        self.cursors.set_single(Selection::new(anchor, head));
+        self.sync_cursor_from_primary();
+    }
+
+    /// Update cursor state from egui's TextEdit cursor range.
+    ///
+    /// This syncs the multi-cursor state with egui's single-cursor model.
+    /// When multi-cursor editing is active, this only updates the primary cursor.
+    pub fn update_cursor_from_egui(&mut self, primary: usize, secondary: usize) {
+        if self.cursors.is_single() {
+            // Single cursor mode: sync from egui
+            if primary == secondary {
+                self.cursors.set_single(Selection::cursor(primary));
+            } else {
+                // egui uses primary as cursor position, secondary as anchor
+                self.cursors.set_single(Selection::new(secondary, primary));
+            }
+        } else {
+            // Multi-cursor mode: only update primary cursor, preserve others
+            let primary_sel = self.cursors.primary_mut();
+            if primary == secondary {
+                primary_sel.anchor = primary;
+                primary_sel.head = primary;
+            } else {
+                primary_sel.anchor = secondary;
+                primary_sel.head = primary;
+            }
+        }
+        self.sync_cursor_from_primary();
+    }
+
+    /// Find the next occurrence of the given text after the specified position.
+    /// Returns (start, end) character indices if found.
+    pub fn find_next_occurrence(&self, search_text: &str, after_pos: usize) -> Option<(usize, usize)> {
+        if search_text.is_empty() {
+            return None;
+        }
+        
+        // Search from after_pos to end
+        if let Some(rel_pos) = self.content[after_pos..].find(search_text) {
+            let start = after_pos + rel_pos;
+            let end = start + search_text.len();
+            return Some((start, end));
+        }
+        
+        // Wrap around: search from beginning to after_pos
+        if let Some(rel_pos) = self.content[..after_pos].find(search_text) {
+            let end = rel_pos + search_text.len();
+            return Some((rel_pos, end));
+        }
+        
+        None
+    }
+
+    /// Get the text under the primary cursor (word at cursor if no selection).
+    pub fn get_primary_selection_text(&self) -> Option<String> {
+        let primary = self.cursors.primary();
+        
+        if primary.is_selection() {
+            // Return selected text
+            let (start, end) = primary.range();
+            if end <= self.content.len() {
+                return Some(self.content[start..end].to_string());
+            }
+        } else {
+            // No selection: find word at cursor
+            return self.word_at_position(primary.head);
+        }
+        
+        None
+    }
+
+    /// Get the word at the given character position.
+    fn word_at_position(&self, pos: usize) -> Option<String> {
+        if self.content.is_empty() || pos > self.content.len() {
+            return None;
+        }
+
+        let chars: Vec<char> = self.content.chars().collect();
+        let char_pos = pos.min(chars.len().saturating_sub(1));
+
+        // Find word boundaries
+        let is_word_char = |c: char| c.is_alphanumeric() || c == '_';
+
+        // Check if we're on a word character
+        if char_pos < chars.len() && !is_word_char(chars[char_pos]) {
+            return None;
+        }
+
+        // Find start of word
+        let mut start = char_pos;
+        while start > 0 && is_word_char(chars[start - 1]) {
+            start -= 1;
+        }
+
+        // Find end of word
+        let mut end = char_pos;
+        while end < chars.len() && is_word_char(chars[end]) {
+            end += 1;
+        }
+
+        if start < end {
+            Some(chars[start..end].iter().collect())
+        } else {
+            None
+        }
+    }
+
+    /// Get the byte range of the word at the given character position.
+    pub fn word_range_at_position(&self, pos: usize) -> Option<(usize, usize)> {
+        if self.content.is_empty() || pos > self.content.len() {
+            return None;
+        }
+
+        let chars: Vec<char> = self.content.chars().collect();
+        let char_pos = pos.min(chars.len().saturating_sub(1));
+
+        let is_word_char = |c: char| c.is_alphanumeric() || c == '_';
+
+        // Check if we're on a word character
+        if char_pos < chars.len() && !is_word_char(chars[char_pos]) {
+            return None;
+        }
+
+        // Find start of word
+        let mut start = char_pos;
+        while start > 0 && is_word_char(chars[start - 1]) {
+            start -= 1;
+        }
+
+        // Find end of word
+        let mut end = char_pos;
+        while end < chars.len() && is_word_char(chars[end]) {
+            end += 1;
+        }
+
+        if start < end {
+            Some((start, end))
+        } else {
+            None
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Transient Highlight (Search Result Navigation)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Set a transient highlight for search result navigation.
+    ///
+    /// This highlight is temporary and will be cleared on scroll, edit, or click.
+    /// The programmatic scroll that positions the match is ignored.
+    pub fn set_transient_highlight(&mut self, start: usize, end: usize) {
+        self.transient_highlight.set(start, end);
+    }
+
+    /// Clear the transient highlight.
+    pub fn clear_transient_highlight(&mut self) {
+        self.transient_highlight.clear();
+    }
+
+    /// Check if a transient highlight is active.
+    pub fn has_transient_highlight(&self) -> bool {
+        self.transient_highlight.is_active()
+    }
+
+    /// Get the transient highlight range if active.
+    pub fn transient_highlight_range(&self) -> Option<(usize, usize)> {
+        self.transient_highlight.range()
+    }
+
+    /// Notify that a scroll event occurred.
+    ///
+    /// This will clear the transient highlight unless it's the first scroll
+    /// after the highlight was set (the programmatic scroll to position the match).
+    pub fn on_scroll_event(&mut self) {
+        self.transient_highlight.on_scroll();
+    }
+
+    /// Notify that an edit event occurred. Clears the transient highlight.
+    pub fn on_edit_event(&mut self) {
+        self.transient_highlight.on_edit();
+    }
+
+    /// Notify that a click event occurred. Clears the transient highlight.
+    pub fn on_click_event(&mut self) {
+        self.transient_highlight.on_click();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Code Folding
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Update fold regions for this tab using the detection algorithm.
+    ///
+    /// This should be called when content changes significantly or when
+    /// folding settings change. The current collapsed states are preserved
+    /// where possible.
+    pub fn update_folds(
+        &mut self,
+        fold_headings: bool,
+        fold_code_blocks: bool,
+        fold_lists: bool,
+        fold_indentation: bool,
+    ) {
+        use crate::editor::folding::detect_fold_regions;
+
+        // Remember currently collapsed fold positions
+        let collapsed_lines: std::collections::HashSet<usize> = self
+            .fold_state
+            .regions()
+            .iter()
+            .filter(|r| r.collapsed)
+            .map(|r| r.start_line)
+            .collect();
+
+        // Detect new fold regions
+        let mut new_state = detect_fold_regions(
+            &self.content,
+            self.file_type,
+            fold_headings,
+            fold_code_blocks,
+            fold_lists,
+            fold_indentation,
+        );
+
+        // Restore collapsed state for matching start lines
+        for region in new_state.regions_mut() {
+            if collapsed_lines.contains(&region.start_line) {
+                region.collapsed = true;
+            }
+        }
+
+        self.fold_state = new_state;
+    }
+
+    /// Mark fold state as needing recomputation.
+    pub fn mark_folds_dirty(&mut self) {
+        self.fold_state.mark_dirty();
+    }
+
+    /// Check if fold state needs recomputation.
+    pub fn folds_dirty(&self) -> bool {
+        self.fold_state.is_dirty()
+    }
+
+    /// Toggle the fold at the given line.
+    ///
+    /// Returns true if a fold was toggled.
+    pub fn toggle_fold_at_line(&mut self, line: usize) -> bool {
+        self.fold_state.toggle_at_line(line)
+    }
+
+    /// Check if a line is hidden by a fold.
+    pub fn is_line_folded(&self, line: usize) -> bool {
+        self.fold_state.is_line_hidden(line)
+    }
+
+    /// Reveal a line by expanding any fold that hides it.
+    pub fn reveal_line(&mut self, line: usize) -> bool {
+        self.fold_state.reveal_line(line)
+    }
+
+    /// Get lines that should show fold indicators.
+    ///
+    /// Returns (line, is_collapsed) for each fold start line.
+    pub fn fold_indicator_lines(&self) -> Vec<(usize, bool)> {
+        self.fold_state.fold_indicator_lines()
+    }
+
+    /// Fold all regions.
+    pub fn fold_all(&mut self) {
+        self.fold_state.fold_all();
+    }
+
+    /// Unfold all regions.
+    pub fn unfold_all(&mut self) {
+        self.fold_state.unfold_all();
+    }
+
+    /// Fold all headings.
+    pub fn fold_all_headings(&mut self) {
+        self.fold_state.fold_all_of_kind(|k| matches!(k, FoldKind::Heading(_)));
+    }
+
+    /// Fold all code blocks.
+    pub fn fold_all_code_blocks(&mut self) {
+        self.fold_state.fold_all_of_kind(|k| matches!(k, FoldKind::CodeBlock));
+    }
+
+    /// Get the number of collapsed folds.
+    pub fn collapsed_fold_count(&self) -> usize {
+        self.fold_state.collapsed_count()
+    }
+
+    /// Get total hidden line count from folds.
+    pub fn hidden_line_count(&self) -> usize {
+        self.fold_state.hidden_line_count()
     }
 }
 
@@ -409,6 +1829,8 @@ pub struct UiState {
     pub toast_expires_at: Option<f64>,
     /// Whether the recent files popup is open
     pub show_recent_files_popup: bool,
+    /// Whether Zen Mode is enabled (distraction-free writing)
+    pub zen_mode: bool,
 }
 
 /// Actions that may need confirmation before execution.
@@ -467,6 +1889,8 @@ pub struct AppState {
     workspace_watcher: Option<WorkspaceWatcher>,
     /// Pending file events from the watcher that need to be processed
     pub pending_file_events: Vec<WorkspaceEvent>,
+    /// Git integration service
+    pub git_service: GitService,
 }
 
 impl AppState {
@@ -496,6 +1920,7 @@ impl AppState {
             workspace: None,
             workspace_watcher: None,
             pending_file_events: Vec::new(),
+            git_service: GitService::new(),
         };
 
         // Try to restore tabs from previous session
@@ -576,6 +2001,7 @@ impl AppState {
             workspace: None,
             workspace_watcher: None,
             pending_file_events: Vec::new(),
+            git_service: GitService::new(),
         };
 
         // Try to restore tabs from session data
@@ -635,12 +2061,15 @@ impl AppState {
     /// Create a new empty tab and make it active.
     ///
     /// Returns the index of the new tab.
+    /// Applies auto_save_enabled_default from settings.
     pub fn new_tab(&mut self) -> usize {
-        let tab = Tab::new(self.next_tab_id);
+        let auto_save_default = self.settings.auto_save_enabled_default;
+        let tab = Tab::new_with_settings(self.next_tab_id, auto_save_default);
         self.next_tab_id += 1;
         self.tabs.push(tab);
         self.active_tab_index = self.tabs.len() - 1;
-        debug!("Created new tab at index {}", self.active_tab_index);
+        debug!("Created new tab at index {} (auto-save: {})", 
+            self.active_tab_index, auto_save_default);
         self.active_tab_index
     }
 
@@ -676,17 +2105,25 @@ impl AppState {
         // Read file content
         let content = std::fs::read_to_string(&path)?;
 
-        // Create new tab
-        let tab = Tab::with_file(self.next_tab_id, path.clone(), content);
+        // Create new tab with settings-based auto-save default
+        let auto_save_default = self.settings.auto_save_enabled_default;
+        let tab = Tab::with_file_and_settings(
+            self.next_tab_id,
+            path.clone(),
+            content,
+            auto_save_default,
+        );
         self.next_tab_id += 1;
         self.tabs.push(tab);
         let new_index = self.tabs.len() - 1;
 
         if focus {
             self.active_tab_index = new_index;
-            info!("Opened file: {} (with focus)", path.display());
+            info!("Opened file: {} (with focus, auto-save: {})", 
+                path.display(), auto_save_default);
         } else {
-            info!("Opened file: {} (in background)", path.display());
+            info!("Opened file: {} (in background, auto-save: {})", 
+                path.display(), auto_save_default);
         }
 
         // Update recent files
@@ -867,6 +2304,21 @@ impl AppState {
         self.workspace_watcher = watcher;
         self.pending_file_events.clear();
 
+        // Initialize Git service for the workspace
+        match self.git_service.open(&root) {
+            Ok(true) => {
+                if let Some(branch) = self.git_service.current_branch() {
+                    info!("Git repository detected, branch: {}", branch);
+                }
+            }
+            Ok(false) => {
+                debug!("No Git repository in workspace");
+            }
+            Err(e) => {
+                warn!("Error checking for Git repository: {}", e);
+            }
+        }
+
         // Add to recent workspaces
         self.settings.add_recent_workspace(root);
         self.settings_dirty = true;
@@ -890,6 +2342,9 @@ impl AppState {
         self.workspace = None;
         self.workspace_watcher = None;
         self.pending_file_events.clear();
+
+        // Close Git service
+        self.git_service.close();
 
         info!("Workspace closed, returned to single-file mode");
     }
@@ -996,6 +2451,251 @@ impl AppState {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // Session State Persistence (Crash Recovery)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Capture the current session state for persistence.
+    ///
+    /// This creates a complete snapshot of the current editor session,
+    /// including all open tabs, their content state, and editor positions.
+    pub fn capture_session_state(&self) -> crate::config::SessionState {
+        use crate::config::{hash_content, SessionAppMode, SessionState, SessionTabState};
+
+        let tabs: Vec<SessionTabState> = self
+            .tabs
+            .iter()
+            .map(|tab| {
+                let file_mtime = tab
+                    .path
+                    .as_ref()
+                    .and_then(|p| Self::get_file_mtime(p));
+
+                let original_content_hash = if !tab.is_modified() {
+                    Some(hash_content(&tab.content))
+                } else {
+                    None
+                };
+
+                SessionTabState {
+                    tab_id: tab.id,
+                    path: tab.path.clone(),
+                    display_title: tab.title(),
+                    view_mode: tab.view_mode,
+                    cursor_char_index: tab.cursors.primary().head,
+                    cursor_position: tab.cursor_position,
+                    selection: tab.cursors.selection_range(),
+                    scroll_offset: tab.scroll_offset,
+                    rendered_scroll_offset: 0.0, // Will be captured if in rendered mode
+                    has_unsaved_content: tab.is_modified(),
+                    file_mtime,
+                    original_content_hash,
+                }
+            })
+            .collect();
+
+        let app_mode = if let Some(root) = self.app_mode.workspace_root() {
+            SessionAppMode::Workspace {
+                root: Some(root.clone()),
+            }
+        } else {
+            SessionAppMode::SingleFile
+        };
+
+        SessionState {
+            version: 1,
+            saved_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            clean_shutdown: true,
+            tabs,
+            active_tab_index: self.active_tab_index,
+            app_mode,
+            zen_mode: self.ui.zen_mode,
+        }
+    }
+
+    /// Save recovery content for tabs with unsaved changes.
+    ///
+    /// This saves the actual content of tabs that have unsaved changes,
+    /// allowing crash recovery to restore the content even if the app crashes.
+    pub fn save_recovery_content(&self) {
+        use crate::config::save_recovery_content;
+
+        for tab in &self.tabs {
+            if tab.is_modified() {
+                if !save_recovery_content(tab.id, &tab.content) {
+                    warn!("Failed to save recovery content for tab {}", tab.id);
+                }
+            }
+        }
+    }
+
+    /// Restore session from a SessionRestoreResult.
+    ///
+    /// This replaces the current tabs with those from the session state,
+    /// optionally using recovered content for tabs with unsaved changes.
+    ///
+    /// Returns `true` if any tabs were restored.
+    pub fn restore_from_session_result(
+        &mut self,
+        result: &crate::config::SessionRestoreResult,
+    ) -> bool {
+        let Some(session) = &result.session else {
+            return false;
+        };
+
+        if session.tabs.is_empty() {
+            return false;
+        }
+
+        // Clear existing tabs
+        self.tabs.clear();
+
+        let mut restored_count = 0;
+
+        for session_tab in &session.tabs {
+            // Try to load content from various sources
+            let content = self.resolve_tab_content(session_tab, result);
+
+            if let Some(content) = content {
+                let mut tab = if let Some(path) = &session_tab.path {
+                    Tab::with_file(self.next_tab_id, path.clone(), content.clone())
+                } else {
+                    let mut tab = Tab::new(self.next_tab_id);
+                    tab.content = content.clone();
+                    tab
+                };
+
+                self.next_tab_id += 1;
+
+                // Restore editor state
+                tab.view_mode = session_tab.view_mode;
+                tab.cursor_position = session_tab.cursor_position;
+                tab.scroll_offset = session_tab.scroll_offset;
+                
+                // Restore cursor from char index
+                tab.cursors.set_single(crate::state::Selection::cursor(session_tab.cursor_char_index));
+                if let Some((start, end)) = session_tab.selection {
+                    tab.cursors.set_single(crate::state::Selection::new(start, end));
+                }
+                tab.sync_cursor_from_primary();
+
+                // If we loaded from recovery content, mark as modified
+                if session_tab.has_unsaved_content && result.recovered_content.contains_key(&session_tab.tab_id) {
+                    // Content was recovered - it's modified relative to what's on disk
+                    // The original_content field stays as the disk version
+                }
+
+                self.tabs.push(tab);
+                restored_count += 1;
+
+                debug!(
+                    "Restored tab {} from session: {}",
+                    session_tab.tab_id,
+                    session_tab.display_title
+                );
+            } else {
+                warn!(
+                    "Could not restore tab {}: {}",
+                    session_tab.tab_id, session_tab.display_title
+                );
+            }
+        }
+
+        // Restore active tab index
+        if !self.tabs.is_empty() {
+            self.active_tab_index = session.active_tab_index.min(self.tabs.len() - 1);
+        }
+
+        // Restore Zen Mode state
+        self.ui.zen_mode = session.zen_mode;
+
+        // Restore workspace mode if it was active
+        if let crate::config::SessionAppMode::Workspace { root: Some(root) } = &session.app_mode {
+            if root.exists() && root.is_dir() {
+                info!("Restoring workspace: {}", root.display());
+                if let Err(e) = self.open_workspace(root.clone()) {
+                    warn!("Failed to restore workspace {}: {}", root.display(), e);
+                }
+            } else {
+                warn!("Workspace path no longer exists: {}", root.display());
+            }
+        }
+
+        info!(
+            "Restored {} of {} tabs from session{}{}",
+            restored_count,
+            session.tabs.len(),
+            if session.zen_mode { " (Zen Mode enabled)" } else { "" },
+            if self.app_mode.is_workspace() { " (Workspace mode)" } else { "" }
+        );
+
+        restored_count > 0
+    }
+
+    /// Resolve content for a tab from various sources.
+    ///
+    /// Priority:
+    /// 1. Recovery content (if tab had unsaved changes)
+    /// 2. File on disk (if path exists)
+    /// 3. None (if file is missing and no recovery content)
+    fn resolve_tab_content(
+        &self,
+        session_tab: &crate::config::SessionTabState,
+        result: &crate::config::SessionRestoreResult,
+    ) -> Option<String> {
+        // First, check if we have recovery content
+        if let Some(recovered) = result.recovered_content.get(&session_tab.tab_id) {
+            debug!(
+                "Using recovered content for tab {} ({})",
+                session_tab.tab_id, session_tab.display_title
+            );
+            return Some(recovered.clone());
+        }
+
+        // Next, try to load from disk
+        if let Some(path) = &session_tab.path {
+            if path.exists() {
+                match std::fs::read_to_string(path) {
+                    Ok(content) => {
+                        debug!("Loaded content from disk for tab {}", session_tab.tab_id);
+                        return Some(content);
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to read file for tab {}: {}: {}",
+                            session_tab.tab_id,
+                            path.display(),
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
+        // For tabs without a path (unsaved documents), we need recovery content
+        if session_tab.path.is_none() && session_tab.has_unsaved_content {
+            debug!(
+                "Unsaved document {} has no recovery content",
+                session_tab.tab_id
+            );
+            return None;
+        }
+
+        None
+    }
+
+    /// Get file modification time as Unix timestamp.
+    fn get_file_mtime(path: &std::path::Path) -> Option<u64> {
+        std::fs::metadata(path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Event Handling
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -1091,6 +2791,16 @@ impl AppState {
     /// Toggle the about/help panel.
     pub fn toggle_about(&mut self) {
         self.ui.show_about = !self.ui.show_about;
+    }
+
+    /// Toggle Zen Mode (distraction-free writing).
+    pub fn toggle_zen_mode(&mut self) {
+        self.ui.zen_mode = !self.ui.zen_mode;
+    }
+
+    /// Check if Zen Mode is enabled.
+    pub fn is_zen_mode(&self) -> bool {
+        self.ui.zen_mode
     }
 
     /// Show an error in a modal dialog.
@@ -1448,6 +3158,7 @@ mod tests {
         tab.cursor_position = (10, 5);
         tab.scroll_offset = 100.0;
         tab.view_mode = ViewMode::Rendered;
+        tab.split_ratio = 0.6;
 
         let info = tab.to_tab_info();
         assert_eq!(info.path, tab.path);
@@ -1455,6 +3166,7 @@ mod tests {
         assert_eq!(info.cursor_position, (10, 5));
         assert_eq!(info.scroll_offset, 100.0);
         assert_eq!(info.view_mode, ViewMode::Rendered);
+        assert_eq!(info.split_ratio, 0.6);
     }
 
     #[test]
@@ -1462,13 +3174,36 @@ mod tests {
         let mut tab = Tab::new(0);
         assert_eq!(tab.view_mode, ViewMode::Raw);
 
+        // Raw → Split
+        let new_mode = tab.toggle_view_mode();
+        assert_eq!(new_mode, ViewMode::Split);
+        assert_eq!(tab.view_mode, ViewMode::Split);
+
+        // Split → Rendered
         let new_mode = tab.toggle_view_mode();
         assert_eq!(new_mode, ViewMode::Rendered);
         assert_eq!(tab.view_mode, ViewMode::Rendered);
 
+        // Rendered → Raw
         let new_mode = tab.toggle_view_mode();
         assert_eq!(new_mode, ViewMode::Raw);
         assert_eq!(tab.view_mode, ViewMode::Raw);
+    }
+
+    #[test]
+    fn test_tab_split_ratio() {
+        let mut tab = Tab::new(0);
+        assert_eq!(tab.get_split_ratio(), 0.5); // Default
+
+        tab.set_split_ratio(0.7);
+        assert_eq!(tab.get_split_ratio(), 0.7);
+
+        // Test clamping
+        tab.set_split_ratio(0.1);
+        assert_eq!(tab.get_split_ratio(), 0.2); // Clamped to min
+
+        tab.set_split_ratio(0.9);
+        assert_eq!(tab.get_split_ratio(), 0.8); // Clamped to max
     }
 
     #[test]
@@ -1684,6 +3419,7 @@ mod tests {
             cursor_position: (10, 5),
             scroll_offset: 100.0,
             view_mode: ViewMode::Rendered, // Test restoring rendered mode
+            split_ratio: 0.6,              // Test restoring split ratio
         };
         let content = "# Test Content".to_string();
 
@@ -1695,6 +3431,7 @@ mod tests {
         assert_eq!(tab.cursor_position, (10, 5));
         assert_eq!(tab.scroll_offset, 100.0);
         assert_eq!(tab.view_mode, ViewMode::Rendered); // View mode restored
+        assert_eq!(tab.split_ratio, 0.6);              // Split ratio restored
         assert!(!tab.is_modified()); // Content matches original
     }
 
@@ -1718,6 +3455,7 @@ mod tests {
             cursor_position: (0, 0),
             scroll_offset: 0.0,
             view_mode: ViewMode::Raw,
+            split_ratio: 0.5,
         }];
 
         let state = AppState::with_settings(settings);
@@ -1737,6 +3475,7 @@ mod tests {
             cursor_position: (5, 10),
             scroll_offset: 50.0,
             view_mode: ViewMode::Raw,
+            split_ratio: 0.5,
         }];
 
         let state = AppState::with_settings(settings);
@@ -1783,6 +3522,7 @@ mod tests {
             cursor_position: (1, 5),
             scroll_offset: 25.0,
             view_mode: ViewMode::Rendered, // Test restoring view mode
+            split_ratio: 0.5,
         }];
         settings.active_tab_index = 0;
 
@@ -1828,6 +3568,7 @@ mod tests {
                 cursor_position: (0, 0),
                 scroll_offset: 0.0,
                 view_mode: ViewMode::Raw, // First tab in raw mode
+                split_ratio: 0.5,
             },
             TabInfo {
                 path: Some(temp_file2.clone()),
@@ -1835,6 +3576,7 @@ mod tests {
                 cursor_position: (0, 0),
                 scroll_offset: 0.0,
                 view_mode: ViewMode::Rendered, // Second tab in rendered mode
+                split_ratio: 0.5,
             },
         ];
         settings.active_tab_index = 1; // Second tab active
@@ -1875,6 +3617,7 @@ mod tests {
                 cursor_position: (0, 0),
                 scroll_offset: 0.0,
                 view_mode: ViewMode::Raw,
+                split_ratio: 0.5,
             },
             TabInfo {
                 path: Some(temp_file.clone()),
@@ -1882,6 +3625,7 @@ mod tests {
                 cursor_position: (0, 0),
                 scroll_offset: 0.0,
                 view_mode: ViewMode::Rendered,
+                split_ratio: 0.5,
             },
         ];
         settings.active_tab_index = 1;

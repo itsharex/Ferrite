@@ -2,6 +2,8 @@
 //!
 //! This module implements a modern ribbon-style interface with icon-based controls
 //! organized into logical groups, replacing the traditional menu bar.
+//!
+//! Design C: Streamlined ribbon with dropdowns, view controls moved to title bar.
 
 use crate::config::ViewMode;
 use crate::markdown::formatting::{FormattingState, MarkdownFormatCommand};
@@ -34,13 +36,13 @@ pub enum RibbonAction {
     Save,
     /// Save As dialog
     SaveAs,
+    /// Toggle auto-save for current document (kept for keyboard shortcut handling)
+    ToggleAutoSave,
 
     // Workspace operations (only visible in workspace mode)
     /// Search in files across workspace (Ctrl+Shift+F)
-    /// Note: Emoji icon (🔎) is temporary placeholder for future SVG/PNG icon
     SearchInFiles,
     /// Quick file switcher / file palette (Ctrl+P)
-    /// Note: Emoji icon (📋) is temporary placeholder for future SVG/PNG icon
     QuickFileSwitcher,
 
     // Edit operations
@@ -58,8 +60,10 @@ pub enum RibbonAction {
     FormatDocument,
     /// Validate syntax of the structured data document
     ValidateSyntax,
+    /// Toggle Live Pipeline panel (JSON/YAML only)
+    TogglePipeline,
 
-    // View operations
+    // View operations (kept for keyboard shortcut handling, but removed from ribbon)
     /// Toggle between Raw and Rendered view
     ToggleViewMode,
     /// Toggle line numbers visibility
@@ -79,11 +83,15 @@ pub enum RibbonAction {
     /// Copy rendered HTML to clipboard
     CopyAsHtml,
 
-    // Settings
+    // Settings (kept for keyboard shortcut handling, but removed from ribbon)
     /// Cycle through themes
     CycleTheme,
     /// Open settings panel (placeholder)
     OpenSettings,
+
+    // Zen Mode (kept for keyboard shortcut handling, but removed from ribbon)
+    /// Toggle Zen Mode (distraction-free writing)
+    ToggleZenMode,
 
     // Ribbon control
     /// Toggle ribbon collapsed state
@@ -135,17 +143,20 @@ impl Ribbon {
     ///
     /// * `ui` - The egui UI context
     /// * `theme_colors` - Current theme colors for styling
-    /// * `view_mode` - Current view mode (Raw/Rendered)
-    /// * `show_line_numbers` - Whether line numbers are currently visible
+    /// * `view_mode` - Current view mode (Raw/Rendered) - kept for compatibility
+    /// * `show_line_numbers` - Whether line numbers are currently visible - kept for compatibility
     /// * `can_undo` - Whether undo is available
     /// * `can_redo` - Whether redo is available
     /// * `can_save` - Whether save is available (file has path and is modified)
     /// * `has_editor` - Whether an editor is currently active
     /// * `formatting_state` - Current formatting state at cursor (for button highlighting)
     /// * `outline_enabled` - Whether outline panel is currently visible
-    /// * `sync_scroll_enabled` - Whether sync scrolling is enabled
+    /// * `sync_scroll_enabled` - Whether sync scrolling is enabled - kept for compatibility
     /// * `is_workspace_mode` - Whether app is in workspace mode
     /// * `file_type` - Current file type for adaptive toolbar
+    /// * `zen_mode_enabled` - Whether Zen Mode is currently enabled - kept for compatibility
+    /// * `auto_save_enabled` - Whether auto-save is enabled for current tab - kept for compatibility
+    /// * `pipeline_enabled` - Whether pipeline panel is enabled
     ///
     /// # Returns
     ///
@@ -155,17 +166,20 @@ impl Ribbon {
         &mut self,
         ui: &mut Ui,
         theme_colors: &ThemeColors,
-        view_mode: ViewMode,
-        show_line_numbers: bool,
+        _view_mode: ViewMode,
+        _show_line_numbers: bool,
         can_undo: bool,
         can_redo: bool,
-        can_save: bool,
+        _can_save: bool,
         has_editor: bool,
         formatting_state: Option<&FormattingState>,
         outline_enabled: bool,
-        sync_scroll_enabled: bool,
+        _sync_scroll_enabled: bool,
         is_workspace_mode: bool,
         file_type: FileType,
+        _zen_mode_enabled: bool,
+        _auto_save_enabled: bool,
+        pipeline_enabled: bool,
     ) -> Option<RibbonAction> {
         let mut action: Option<RibbonAction> = None;
         let is_dark = theme_colors.is_dark();
@@ -177,10 +191,11 @@ impl Ribbon {
             Color32::from_rgb(248, 248, 248)
         };
 
+        // Separator color for ribbon dividers
         let separator_color = if is_dark {
             Color32::from_rgb(70, 70, 70)
         } else {
-            Color32::from_rgb(210, 210, 210)
+            Color32::from_rgb(165, 165, 165)
         };
 
         // Set ribbon background
@@ -207,7 +222,7 @@ impl Ribbon {
             ui.add_space(4.0);
 
             // ═══════════════════════════════════════════════════════════════════
-            // File Group
+            // File Group (Streamlined with Save Dropdown)
             // ═══════════════════════════════════════════════════════════════════
             if !self.collapsed {
                 ui.label(
@@ -217,10 +232,12 @@ impl Ribbon {
                 );
             }
 
+            // New file button
             if icon_button(ui, "📄", "New (Ctrl+N)", true, is_dark).clicked() {
                 action = Some(RibbonAction::New);
             }
 
+            // Open file button
             if icon_button(ui, "📂", "Open File (Ctrl+O)", true, is_dark).clicked() {
                 action = Some(RibbonAction::Open);
             }
@@ -236,28 +253,38 @@ impl Ribbon {
             }
 
             // Workspace-only buttons: Search in Files and Quick File Switcher
-            // Note: Emoji icons are temporary placeholders for future SVG/PNG replacement
             if is_workspace_mode {
-                // Search in Files button (🔎 is temporary icon)
                 if icon_button(ui, "🔎", "Search in Files (Ctrl+Shift+F)", true, is_dark).clicked()
                 {
                     action = Some(RibbonAction::SearchInFiles);
                 }
 
-                // Quick File Switcher button (📋 is temporary icon)
-                // Note: Using 📋 (clipboard) as distinct from outline panel's use of same icon
                 if icon_button(ui, "⚡", "Quick File Switcher (Ctrl+P)", true, is_dark).clicked() {
                     action = Some(RibbonAction::QuickFileSwitcher);
                 }
             }
 
-            if icon_button(ui, "💾", "Save (Ctrl+S)", can_save, is_dark).clicked() {
-                action = Some(RibbonAction::Save);
-            }
-
-            if icon_button(ui, "📥", "Save As (Ctrl+Shift+S)", true, is_dark).clicked() {
-                action = Some(RibbonAction::SaveAs);
-            }
+            // Save Dropdown - replaces separate Save and SaveAs buttons
+            // Note: ComboBox adds its own dropdown arrow, so we don't add ▾ manually
+            egui::ComboBox::from_id_source("save_dropdown")
+                .selected_text(RichText::new("💾").size(14.0))
+                .width(40.0)
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(false, "💾 Save")
+                        .on_hover_text("Save (Ctrl+S)")
+                        .clicked()
+                    {
+                        action = Some(RibbonAction::Save);
+                    }
+                    if ui
+                        .selectable_label(false, "📥 Save As...")
+                        .on_hover_text("Save As (Ctrl+Shift+S)")
+                        .clicked()
+                    {
+                        action = Some(RibbonAction::SaveAs);
+                    }
+                });
 
             ui.add_space(4.0);
             vertical_separator(ui, separator_color, self.height() - 8.0);
@@ -312,7 +339,7 @@ impl Ribbon {
                     has_editor,
                     is_bold,
                     is_dark,
-                    true, // bold style
+                    true,
                 )
                 .clicked()
                 {
@@ -327,7 +354,7 @@ impl Ribbon {
                     has_editor,
                     is_italic,
                     is_dark,
-                    false, // italic style applied in function
+                    false,
                 )
                 .clicked()
                 {
@@ -492,71 +519,26 @@ impl Ribbon {
                     action = Some(RibbonAction::ValidateSyntax);
                 }
 
+                // Pipeline button (JSON/YAML only, not TOML)
+                if matches!(file_type, FileType::Json | FileType::Yaml) {
+                    if icon_button(
+                        ui,
+                        "⚡",
+                        "Live Pipeline (Ctrl+Shift+L)\nPipe document through shell commands",
+                        has_editor && pipeline_enabled,
+                        is_dark,
+                    )
+                    .clicked()
+                    {
+                        action = Some(RibbonAction::TogglePipeline);
+                    }
+                }
+
                 ui.add_space(4.0);
                 vertical_separator(ui, separator_color, self.height() - 8.0);
                 ui.add_space(4.0);
-            } else {
-                // Unknown file type - show minimal format group or skip
-                // For now, skip the format group for unknown file types
             }
-
-            // ═══════════════════════════════════════════════════════════════════
-            // View Group
-            // ═══════════════════════════════════════════════════════════════════
-            if !self.collapsed {
-                ui.label(
-                    RichText::new("View")
-                        .size(10.0)
-                        .color(theme_colors.text.muted),
-                );
-            }
-
-            // View mode toggle - for markdown and structured data files
-            if file_type.is_markdown() || file_type.is_structured() {
-                let view_icon = match view_mode {
-                    ViewMode::Raw => "📝",
-                    ViewMode::Rendered => "👁",
-                };
-                let view_tooltip = match (file_type.is_structured(), view_mode) {
-                    // For structured data, "Rendered" means tree viewer
-                    (true, ViewMode::Raw) => "Switch to Tree View (Ctrl+E)",
-                    (true, ViewMode::Rendered) => "Switch to Raw Editor (Ctrl+E)",
-                    // For markdown
-                    (false, ViewMode::Raw) => "Switch to Rendered View (Ctrl+E)",
-                    (false, ViewMode::Rendered) => "Switch to Raw Editor (Ctrl+E)",
-                };
-                if icon_button(ui, view_icon, view_tooltip, true, is_dark).clicked() {
-                    action = Some(RibbonAction::ToggleViewMode);
-                }
-            }
-
-            // Line numbers toggle (universal)
-            let line_num_icon = if show_line_numbers { "🔢" } else { "#" };
-            let line_num_tooltip = if show_line_numbers {
-                "Hide Line Numbers"
-            } else {
-                "Show Line Numbers"
-            };
-            if icon_button(ui, line_num_icon, line_num_tooltip, true, is_dark).clicked() {
-                action = Some(RibbonAction::ToggleLineNumbers);
-            }
-
-            // Sync scroll toggle - only for markdown files
-            if file_type.is_markdown() {
-                let sync_icon = if sync_scroll_enabled { "🔗" } else { "⛓" };
-                let sync_tooltip = if sync_scroll_enabled {
-                    "Disable Sync Scroll"
-                } else {
-                    "Enable Sync Scroll"
-                };
-                if icon_button(ui, sync_icon, sync_tooltip, true, is_dark).clicked() {
-                    action = Some(RibbonAction::ToggleSyncScroll);
-                }
-            }
-
-            ui.add_space(4.0);
-            vertical_separator(ui, separator_color, self.height() - 8.0);
-            ui.add_space(4.0);
+            // Note: View Group removed - controls moved to title bar
 
             // ═══════════════════════════════════════════════════════════════════
             // Tools Group
@@ -574,7 +556,7 @@ impl Ribbon {
                 action = Some(RibbonAction::FindReplace);
             }
 
-            // Outline toggle - for markdown shows headings, for structured data shows statistics
+            // Outline toggle
             let outline_icon = if outline_enabled { "📑" } else { "📋" };
             let outline_tooltip = if file_type.is_markdown() {
                 if outline_enabled {
@@ -600,64 +582,38 @@ impl Ribbon {
             ui.add_space(4.0);
 
             // ═══════════════════════════════════════════════════════════════════
-            // Export Group (Markdown only)
+            // Export Dropdown (Markdown only)
             // ═══════════════════════════════════════════════════════════════════
             if file_type.is_markdown() {
-                if !self.collapsed {
-                    ui.label(
-                        RichText::new("Export")
-                            .size(10.0)
-                            .color(theme_colors.text.muted),
-                    );
-                }
-
-                // Export as HTML
-                if icon_button(
-                    ui,
-                    "🌐",
-                    "Export as HTML (Ctrl+Shift+E)",
-                    has_editor,
-                    is_dark,
-                )
-                .clicked()
-                {
-                    action = Some(RibbonAction::ExportHtml);
-                }
-
-                // Copy as HTML
-                if icon_button(ui, "📋", "Copy as HTML", has_editor, is_dark).clicked() {
-                    action = Some(RibbonAction::CopyAsHtml);
-                }
-
-                ui.add_space(4.0);
-                vertical_separator(ui, separator_color, self.height() - 8.0);
-                ui.add_space(4.0);
+                // Note: ComboBox adds its own dropdown arrow, so we don't add ▾ manually
+                let export_label = if self.collapsed { "🌐" } else { "Export" };
+                egui::ComboBox::from_id_source("export_dropdown")
+                    .selected_text(RichText::new(export_label).size(12.0))
+                    .width(if self.collapsed { 40.0 } else { 65.0 })
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(false, "🌐 Export as HTML")
+                            .on_hover_text("Export as HTML (Ctrl+Shift+E)")
+                            .clicked()
+                        {
+                            action = Some(RibbonAction::ExportHtml);
+                        }
+                        if ui
+                            .selectable_label(false, "📋 Copy as HTML")
+                            .on_hover_text("Copy rendered HTML to clipboard")
+                            .clicked()
+                        {
+                            action = Some(RibbonAction::CopyAsHtml);
+                        }
+                        ui.separator();
+                        ui.add_enabled_ui(false, |ui| {
+                            ui.selectable_label(false, "📄 Export as PDF")
+                                .on_hover_text("Coming soon");
+                        });
+                    });
             }
 
-            // ═══════════════════════════════════════════════════════════════════
-            // Settings Group (right-aligned)
-            // ═══════════════════════════════════════════════════════════════════
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add_space(8.0);
-
-                // Settings button
-                if icon_button(ui, "⚙", "Settings (Ctrl+,)", true, is_dark).clicked() {
-                    action = Some(RibbonAction::OpenSettings);
-                }
-
-                // Theme cycle button
-                if icon_button(ui, "🎨", "Change Theme (Ctrl+Shift+T)", true, is_dark).clicked() {
-                    action = Some(RibbonAction::CycleTheme);
-                }
-
-                if !self.collapsed {
-                    ui.label(
-                        RichText::new("Settings")
-                            .size(10.0)
-                            .color(theme_colors.text.muted),
-                    );
-                }
-            });
+            // Note: Settings Group removed - controls moved to title bar and Settings panel
         });
 
         // Draw bottom border
@@ -675,18 +631,6 @@ impl Ribbon {
 }
 
 /// Render an icon button with consistent styling.
-///
-/// # Arguments
-///
-/// * `ui` - The egui UI context
-/// * `icon` - The icon character/emoji to display
-/// * `tooltip` - Hover tooltip text
-/// * `enabled` - Whether the button is interactive
-/// * `is_dark` - Whether using dark theme
-///
-/// # Returns
-///
-/// The button response
 fn icon_button(ui: &mut Ui, icon: &str, tooltip: &str, enabled: bool, is_dark: bool) -> Response {
     let text_color = if enabled {
         if is_dark {
@@ -706,30 +650,26 @@ fn icon_button(ui: &mut Ui, icon: &str, tooltip: &str, enabled: bool, is_dark: b
         Color32::from_rgb(220, 220, 220)
     };
 
-    // Use an invisible button as the clickable area
     let btn = ui.add_enabled(
         enabled,
-        egui::Button::new(RichText::new(" ").size(16.0)) // Empty space for sizing
+        egui::Button::new(RichText::new(" ").size(16.0))
             .frame(false)
             .min_size(ICON_BUTTON_SIZE),
     );
 
-    // Draw hover background if hovered
     if btn.hovered() && enabled {
         ui.painter()
             .rect_filled(btn.rect, egui::Rounding::same(3.0), hover_bg);
     }
 
     // Apply vertical offset for icons that render at wrong baseline
-    // The gear icon (⚙) is a Unicode symbol that renders higher than emoji
     let y_offset = match icon {
-        "⚙" => 2.0, // Gear icon renders too high, shift down
+        "⚙" => 2.0,
         _ => 0.0,
     };
 
     let icon_pos = egui::pos2(btn.rect.center().x, btn.rect.center().y + y_offset);
 
-    // Always draw the icon text centered in the button rect for consistent alignment
     ui.painter().text(
         icon_pos,
         egui::Align2::CENTER_CENTER,
@@ -742,20 +682,6 @@ fn icon_button(ui: &mut Ui, icon: &str, tooltip: &str, enabled: bool, is_dark: b
 }
 
 /// Render a format button with active state highlighting.
-///
-/// # Arguments
-///
-/// * `ui` - The egui UI context
-/// * `icon` - The icon character/text to display
-/// * `tooltip` - Hover tooltip text
-/// * `enabled` - Whether the button is interactive
-/// * `active` - Whether the format is currently active (for highlighting)
-/// * `is_dark` - Whether using dark theme
-/// * `bold_text` - Whether to render the icon text in bold
-///
-/// # Returns
-///
-/// The button response
 #[allow(clippy::too_many_arguments)]
 fn format_button(
     ui: &mut Ui,
@@ -779,9 +705,9 @@ fn format_button(
     };
 
     let active_bg = if is_dark {
-        Color32::from_rgb(70, 90, 120) // Blue-ish highlight for dark mode
+        Color32::from_rgb(70, 90, 120)
     } else {
-        Color32::from_rgb(200, 220, 240) // Light blue for light mode
+        Color32::from_rgb(200, 220, 240)
     };
 
     let hover_bg = if is_dark {
@@ -802,12 +728,10 @@ fn format_button(
             .min_size(Vec2::new(24.0, 22.0)),
     );
 
-    // Draw active or hover background
     if active && enabled {
         ui.painter()
             .rect_filled(btn.rect, egui::Rounding::same(3.0), active_bg);
 
-        // Redraw text on top
         let font_id = if bold_text {
             egui::FontId::new(12.0, egui::FontFamily::Name("Inter-Bold".into()))
         } else {
@@ -824,7 +748,6 @@ fn format_button(
         ui.painter()
             .rect_filled(btn.rect, egui::Rounding::same(3.0), hover_bg);
 
-        // Redraw text on top
         let font_id = if bold_text {
             egui::FontId::new(12.0, egui::FontFamily::Name("Inter-Bold".into()))
         } else {
@@ -877,12 +800,10 @@ mod tests {
     fn test_ribbon_height() {
         let mut ribbon = Ribbon::new();
 
-        // Expanded height
         assert_eq!(ribbon.height(), RIBBON_HEIGHT_EXPANDED);
 
         ribbon.toggle_collapsed();
 
-        // Collapsed height
         assert_eq!(ribbon.height(), RIBBON_HEIGHT_COLLAPSED);
     }
 

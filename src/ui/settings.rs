@@ -146,17 +146,6 @@ impl SettingsPanel {
                                 self.active_section = section;
                             }
                         }
-
-                        ui.add_space(ui.available_height() - 40.0);
-
-                        // Reset button at bottom of sidebar
-                        if ui
-                            .add_sized([110.0, 28.0], egui::Button::new("↺ Reset All"))
-                            .on_hover_text("Reset all settings to defaults")
-                            .clicked()
-                        {
-                            output.reset_requested = true;
-                        }
                     });
 
                     ui.separator();
@@ -190,6 +179,15 @@ impl SettingsPanel {
 
                 // Bottom buttons
                 ui.horizontal(|ui| {
+                    // Reset button on the left
+                    if ui
+                        .button("↺ Reset All")
+                        .on_hover_text("Reset all settings to defaults")
+                        .clicked()
+                    {
+                        output.reset_requested = true;
+                    }
+
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("Close").clicked() {
                             output.close_requested = true;
@@ -328,6 +326,39 @@ impl SettingsPanel {
 
         ui.add_space(4.0);
 
+        // Minimap toggle
+        if ui
+            .checkbox(&mut settings.minimap_enabled, "Show Minimap")
+            .on_hover_text("Display a minimap navigation panel on the right side of the editor")
+            .changed()
+        {
+            changed = true;
+        }
+
+        ui.add_space(4.0);
+
+        // Bracket matching toggle
+        if ui
+            .checkbox(&mut settings.highlight_matching_pairs, "Highlight Matching Brackets")
+            .on_hover_text("Highlight matching brackets (), [], {}, <> and emphasis pairs ** and __ when cursor is adjacent")
+            .changed()
+        {
+            changed = true;
+        }
+
+        ui.add_space(4.0);
+
+        // Syntax highlighting toggle
+        if ui
+            .checkbox(&mut settings.syntax_highlighting_enabled, "Syntax Highlighting")
+            .on_hover_text("Enable syntax highlighting for source code files (Rust, Python, JavaScript, etc.)")
+            .changed()
+        {
+            changed = true;
+        }
+
+        ui.add_space(4.0);
+
         // Sync scroll toggle
         if ui
             .checkbox(&mut settings.sync_scroll_enabled, "Sync Scroll")
@@ -386,6 +417,73 @@ impl SettingsPanel {
             }
         });
 
+        ui.add_space(16.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        // Code Folding section
+        ui.label(RichText::new("Code Folding").strong());
+        ui.add_space(4.0);
+
+        // Master folding toggle
+        if ui
+            .checkbox(&mut settings.folding_enabled, "Enable Code Folding")
+            .on_hover_text("Allow collapsing sections of the document (Ctrl+Shift+[ to fold all, Ctrl+Shift+] to unfold)")
+            .changed()
+        {
+            changed = true;
+        }
+
+        // Only show sub-options if folding is enabled
+        if settings.folding_enabled {
+            ui.add_space(4.0);
+            ui.indent("fold_options", |ui| {
+                if ui
+                    .checkbox(&mut settings.folding_show_indicators, "Show Fold Indicators")
+                    .on_hover_text("Display fold indicators (▶/▼) in the gutter")
+                    .changed()
+                {
+                    changed = true;
+                }
+
+                ui.add_space(4.0);
+                ui.label(RichText::new("Fold Types:").small());
+                ui.add_space(2.0);
+
+                if ui
+                    .checkbox(&mut settings.fold_headings, "Headings")
+                    .on_hover_text("Fold markdown headings and their content")
+                    .changed()
+                {
+                    changed = true;
+                }
+
+                if ui
+                    .checkbox(&mut settings.fold_code_blocks, "Code Blocks")
+                    .on_hover_text("Fold fenced code blocks (```...```)")
+                    .changed()
+                {
+                    changed = true;
+                }
+
+                if ui
+                    .checkbox(&mut settings.fold_lists, "Lists")
+                    .on_hover_text("Fold nested list hierarchies")
+                    .changed()
+                {
+                    changed = true;
+                }
+
+                if ui
+                    .checkbox(&mut settings.fold_indentation, "Indentation (JSON/YAML)")
+                    .on_hover_text("Fold indentation-based structures in JSON/YAML files")
+                    .changed()
+                {
+                    changed = true;
+                }
+            });
+        }
+
         changed
     }
 
@@ -398,10 +496,10 @@ impl SettingsPanel {
         ui.heading("Files");
         ui.add_space(8.0);
 
-        // Auto-save toggle
+        // Auto-save toggle (default for new documents)
         if ui
-            .checkbox(&mut settings.auto_save, "Enable Auto-Save")
-            .on_hover_text("Automatically save files at regular intervals")
+            .checkbox(&mut settings.auto_save_enabled_default, "Enable Auto-Save by Default")
+            .on_hover_text("New documents will have auto-save enabled. Uses temp files to prevent data loss.")
             .changed()
         {
             changed = true;
@@ -409,33 +507,35 @@ impl SettingsPanel {
 
         ui.add_space(4.0);
 
-        // Auto-save interval (only enabled when auto-save is on)
-        ui.add_enabled_ui(settings.auto_save, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Auto-save interval:");
-                ui.add_space(8.0);
-                ui.label(format!("{} seconds", settings.auto_save_interval_secs));
-            });
-            ui.add_space(4.0);
+        // Auto-save delay
+        ui.horizontal(|ui| {
+            ui.label("Auto-save delay:");
+            ui.add_space(8.0);
+            let secs = settings.auto_save_delay_ms / 1000;
+            ui.label(format!("{} seconds", secs));
+        });
+        ui.add_space(4.0);
 
-            let interval_slider = ui.add(
-                egui::Slider::new(&mut settings.auto_save_interval_secs, 5..=300)
-                    .show_value(false)
-                    .step_by(5.0),
-            );
-            if interval_slider.changed() {
-                changed = true;
-            }
+        // Convert ms to seconds for slider display
+        let mut delay_secs = (settings.auto_save_delay_ms / 1000) as f32;
+        let delay_slider = ui.add(
+            egui::Slider::new(&mut delay_secs, 5.0..=300.0)
+                .show_value(false)
+                .step_by(5.0),
+        );
+        if delay_slider.changed() {
+            settings.auto_save_delay_ms = (delay_secs as u32) * 1000;
+            changed = true;
+        }
 
-            // Interval presets
-            ui.horizontal(|ui| {
-                for (label, secs) in [("30s", 30), ("1m", 60), ("5m", 300)] {
-                    if ui.small_button(label).clicked() {
-                        settings.auto_save_interval_secs = secs;
-                        changed = true;
-                    }
+        // Delay presets
+        ui.horizontal(|ui| {
+            for (label, ms) in [("15s", 15000), ("30s", 30000), ("1m", 60000)] {
+                if ui.small_button(label).clicked() {
+                    settings.auto_save_delay_ms = ms;
+                    changed = true;
                 }
-            });
+            }
         });
 
         ui.add_space(16.0);

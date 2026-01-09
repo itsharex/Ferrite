@@ -9,6 +9,6 @@ Icon=ferrite
 Terminal=false
 Categories=Utility;Development;TextEditor;
 Keywords=markdown;editor;text;json;yaml;
-MimeType=text/plain;text/markdown;text/x-markdown;application/json;application/x-yaml;
+MimeType=text/plain;text/markdown;text/x-markdown;application/json;application/x-yaml;application/toml;text/x-toml;
 StartupNotify=true
 StartupWMClass=ferrite

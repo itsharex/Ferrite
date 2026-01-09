@@ -52,7 +52,7 @@ impl Tab {
 }
 ```
 
-### EditorWidget Integration
+### EditorWidget Integration (Raw Mode)
 
 The `EditorWidget` captures content before showing `TextEdit`, then records if changed:
 
@@ -68,6 +68,33 @@ if self.tab.content != original_content {
     self.tab.record_edit(original_content);
 }
 ```
+
+### MarkdownEditor and TreeViewer Integration (Rendered Mode)
+
+Unlike `EditorWidget`, the `MarkdownEditor` (WYSIWYG mode) and `TreeViewer` (JSON/YAML/TOML) only receive `&mut String` content references, not the full `Tab`. Recording must be done at the app level:
+
+```rust
+// In app.rs - for MarkdownEditor
+let content_before = tab.content.clone();
+let editor_output = MarkdownEditor::new(&mut tab.content)
+    // ... configuration ...
+    .show(ui);
+
+if editor_output.changed {
+    tab.record_edit(content_before);  // Record for undo at app level
+}
+
+// Same pattern for TreeViewer
+let content_before = tab.content.clone();
+let output = TreeViewer::new(&mut tab.content, file_type, tree_state)
+    .show(ui);
+
+if output.changed {
+    tab.record_edit(content_before);
+}
+```
+
+**Important:** This app-level integration was added in Task 68 to fix a bug where rendered mode edits were not undoable.
 
 ### Content Version for External Changes
 

@@ -314,8 +314,17 @@ pub fn parse_markdown_with_options(
     let mut front_matter = None;
     let converted_root = convert_node(root, &mut front_matter)?;
 
+    // FIX: Comrak returns line numbers as if frontmatter doesn't exist.
+    // When frontmatter is present, we need to calculate the offset and adjust all line numbers.
+    let line_offset = calculate_frontmatter_offset(&converted_root);
+    let adjusted_root = if line_offset > 0 {
+        adjust_line_numbers(converted_root, line_offset)
+    } else {
+        converted_root
+    };
+
     Ok(MarkdownDocument {
-        root: converted_root,
+        root: adjusted_root,
         source: markdown.to_string(),
         front_matter,
     })
@@ -324,6 +333,56 @@ pub fn parse_markdown_with_options(
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal Conversion Functions
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Calculate the line offset caused by frontmatter.
+/// Comrak returns line numbers as if frontmatter doesn't exist, so we need to
+/// find the frontmatter node and use its actual source line count as offset.
+fn calculate_frontmatter_offset(root: &MarkdownNode) -> usize {
+    // Look for a FrontMatter node at the start
+    if let Some(first_child) = root.children.first() {
+        if let MarkdownNodeType::FrontMatter(content) = &first_child.node_type {
+            // Count lines in frontmatter content, plus 2 for the --- delimiters
+            let content_lines = content.lines().count();
+            // Frontmatter format: ---\ncontent\n---\n
+            // The delimiters add 2 lines, but comrak might include them in content
+            // We check if content starts/ends with --- to avoid double-counting
+            let has_start_delimiter = content.starts_with("---");
+            let has_end_delimiter = content.trim_end().ends_with("---");
+            
+            let delimiter_lines = match (has_start_delimiter, has_end_delimiter) {
+                (true, true) => 0,   // Both included in content
+                (true, false) => 1,  // Only start included
+                (false, true) => 1,  // Only end included  
+                (false, false) => 2, // Neither included
+            };
+            
+            return content_lines + delimiter_lines;
+        }
+    }
+    0
+}
+
+/// Recursively adjust all line numbers in the AST by the given offset.
+fn adjust_line_numbers(mut node: MarkdownNode, offset: usize) -> MarkdownNode {
+    // Don't adjust the FrontMatter node itself (it should stay at line 0 or 1)
+    if !matches!(node.node_type, MarkdownNodeType::FrontMatter(_)) {
+        // Only adjust if the line numbers are non-zero (line 0 is special for document root)
+        if node.start_line > 0 {
+            node.start_line += offset;
+        }
+        if node.end_line > 0 {
+            node.end_line += offset;
+        }
+    }
+    
+    // Recursively adjust children
+    node.children = node.children
+        .into_iter()
+        .map(|child| adjust_line_numbers(child, offset))
+        .collect();
+    
+    node
+}
 
 /// Convert a comrak AST node to our MarkdownNode structure.
 fn convert_node<'a>(

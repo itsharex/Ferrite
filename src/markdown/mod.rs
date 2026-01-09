@@ -41,6 +41,7 @@
 mod ast_ops;
 mod editor;
 pub mod formatting;
+pub mod mermaid;
 mod parser;
 pub mod syntax;
 pub mod tree_viewer;

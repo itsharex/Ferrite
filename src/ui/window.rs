@@ -251,9 +251,331 @@ pub fn get_resize_zone_rect(window_rect: Rect, edge: ResizeDirection) -> Rect {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// Viewport Constraint Utilities
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Constraints for a floating panel or window.
+#[derive(Debug, Clone)]
+pub struct PanelConstraints {
+    /// Minimum width of the panel.
+    pub min_width: f32,
+    /// Maximum width of the panel.
+    pub max_width: f32,
+    /// Minimum height of the panel.
+    pub min_height: f32,
+    /// Maximum height of the panel.
+    pub max_height: f32,
+    /// Margin from viewport edges.
+    pub margin: f32,
+}
+
+impl Default for PanelConstraints {
+    fn default() -> Self {
+        Self {
+            min_width: 200.0,
+            max_width: 800.0,
+            min_height: 150.0,
+            max_height: 600.0,
+            margin: 8.0,
+        }
+    }
+}
+
+/// Result of constraining a panel to viewport bounds.
+#[derive(Debug, Clone)]
+pub struct ConstrainedPanel {
+    /// The constrained position (top-left corner).
+    pub pos: Pos2,
+    /// The constrained size.
+    pub size: egui::Vec2,
+    /// Whether the panel was resized to fit.
+    pub was_resized: bool,
+    /// Whether the panel was repositioned to fit.
+    pub was_repositioned: bool,
+}
+
+/// Constrain a rectangle to fit within viewport bounds.
+///
+/// This function ensures a panel or floating window fits entirely within
+/// the visible viewport, respecting minimum/maximum size constraints and
+/// maintaining a margin from edges.
+///
+/// # Arguments
+///
+/// * `desired_rect` - The desired position and size of the panel
+/// * `viewport` - The available viewport bounds (typically `ctx.screen_rect()`)
+/// * `constraints` - Size constraints and margin settings
+///
+/// # Returns
+///
+/// A `ConstrainedPanel` with the adjusted position and size.
+///
+/// # Example
+///
+/// ```ignore
+/// let viewport = ctx.screen_rect();
+/// let desired = Rect::from_min_size(Pos2::new(100.0, 100.0), Vec2::new(500.0, 400.0));
+/// let result = constrain_rect_to_viewport(desired, viewport, &PanelConstraints::default());
+/// // Use result.pos and result.size to position the window
+/// ```
+pub fn constrain_rect_to_viewport(
+    desired_rect: Rect,
+    viewport: Rect,
+    constraints: &PanelConstraints,
+) -> ConstrainedPanel {
+    let margin = constraints.margin;
+    let mut was_resized = false;
+    let mut was_repositioned = false;
+
+    // Calculate the available area (viewport minus margins)
+    let available = Rect::from_min_max(
+        Pos2::new(viewport.min.x + margin, viewport.min.y + margin),
+        Pos2::new(viewport.max.x - margin, viewport.max.y - margin),
+    );
+
+    // Calculate maximum allowed dimensions based on available space
+    let max_available_width = available.width().max(constraints.min_width);
+    let max_available_height = available.height().max(constraints.min_height);
+
+    // Constrain size to both configured limits and available space
+    let mut width = desired_rect.width();
+    let mut height = desired_rect.height();
+
+    // Apply size constraints
+    if width < constraints.min_width {
+        width = constraints.min_width;
+        was_resized = true;
+    }
+    if width > constraints.max_width {
+        width = constraints.max_width;
+        was_resized = true;
+    }
+    if width > max_available_width {
+        width = max_available_width;
+        was_resized = true;
+    }
+
+    if height < constraints.min_height {
+        height = constraints.min_height;
+        was_resized = true;
+    }
+    if height > constraints.max_height {
+        height = constraints.max_height;
+        was_resized = true;
+    }
+    if height > max_available_height {
+        height = max_available_height;
+        was_resized = true;
+    }
+
+    let size = egui::Vec2::new(width, height);
+
+    // Calculate initial position (using center of desired rect as anchor)
+    let desired_center = desired_rect.center();
+    let mut pos = Pos2::new(desired_center.x - width / 2.0, desired_center.y - height / 2.0);
+
+    // Clamp position to keep panel within available area
+    // Check right edge
+    if pos.x + width > available.max.x {
+        pos.x = available.max.x - width;
+        was_repositioned = true;
+    }
+    // Check left edge
+    if pos.x < available.min.x {
+        pos.x = available.min.x;
+        was_repositioned = true;
+    }
+    // Check bottom edge
+    if pos.y + height > available.max.y {
+        pos.y = available.max.y - height;
+        was_repositioned = true;
+    }
+    // Check top edge
+    if pos.y < available.min.y {
+        pos.y = available.min.y;
+        was_repositioned = true;
+    }
+
+    // Log constraint adjustments in debug builds
+    #[cfg(debug_assertions)]
+    if was_resized || was_repositioned {
+        log::debug!(
+            "Panel constrained: desired {:?} -> pos {:?}, size {:?} (resized: {}, repositioned: {})",
+            desired_rect,
+            pos,
+            size,
+            was_resized,
+            was_repositioned
+        );
+    }
+
+    ConstrainedPanel {
+        pos,
+        size,
+        was_resized,
+        was_repositioned,
+    }
+}
+
+/// Calculate a centered position for a panel within the viewport.
+///
+/// This is a convenience function for panels that should be centered
+/// in the visible area.
+///
+/// # Arguments
+///
+/// * `viewport` - The available viewport bounds
+/// * `panel_size` - The desired size of the panel
+/// * `constraints` - Size constraints and margin settings
+///
+/// # Returns
+///
+/// A `ConstrainedPanel` centered in the viewport with proper constraints.
+pub fn center_panel_in_viewport(
+    viewport: Rect,
+    panel_size: egui::Vec2,
+    constraints: &PanelConstraints,
+) -> ConstrainedPanel {
+    let center = viewport.center();
+    let desired_rect = Rect::from_center_size(center, panel_size);
+    constrain_rect_to_viewport(desired_rect, viewport, constraints)
+}
+
+/// Get constraints suitable for the Search in Files panel.
+pub fn search_panel_constraints() -> PanelConstraints {
+    PanelConstraints {
+        min_width: 350.0,  // Minimum to show search field + buttons
+        max_width: 700.0,  // Don't get too wide
+        min_height: 200.0, // Show at least search field + a few results
+        max_height: 600.0, // Don't take up entire screen
+        margin: 16.0,      // Keep some padding from edges
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Viewport Constraint Tests
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_constrain_rect_centered() {
+        let viewport = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(800.0, 600.0));
+        let constraints = PanelConstraints::default();
+
+        // Panel that fits easily - should stay centered
+        let desired = Rect::from_center_size(viewport.center(), egui::vec2(400.0, 300.0));
+        let result = constrain_rect_to_viewport(desired, viewport, &constraints);
+
+        assert!(!result.was_resized);
+        assert!(!result.was_repositioned);
+        assert_eq!(result.size, egui::vec2(400.0, 300.0));
+    }
+
+    #[test]
+    fn test_constrain_rect_too_large() {
+        let viewport = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(400.0, 300.0));
+        let constraints = PanelConstraints {
+            min_width: 200.0,
+            max_width: 800.0,
+            min_height: 150.0,
+            max_height: 600.0,
+            margin: 10.0,
+        };
+
+        // Panel larger than viewport - should be shrunk
+        let desired = Rect::from_center_size(viewport.center(), egui::vec2(600.0, 500.0));
+        let result = constrain_rect_to_viewport(desired, viewport, &constraints);
+
+        assert!(result.was_resized);
+        // Should fit within viewport minus margins
+        assert!(result.size.x <= 380.0); // 400 - 2*10
+        assert!(result.size.y <= 280.0); // 300 - 2*10
+    }
+
+    #[test]
+    fn test_constrain_rect_off_screen_right() {
+        let viewport = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(800.0, 600.0));
+        let constraints = PanelConstraints {
+            margin: 10.0,
+            ..Default::default()
+        };
+
+        // Panel positioned off the right edge
+        let desired = Rect::from_min_size(Pos2::new(700.0, 200.0), egui::vec2(200.0, 200.0));
+        let result = constrain_rect_to_viewport(desired, viewport, &constraints);
+
+        assert!(result.was_repositioned);
+        // Should be moved left to fit
+        assert!(result.pos.x + result.size.x <= 790.0); // 800 - 10
+    }
+
+    #[test]
+    fn test_constrain_rect_off_screen_bottom() {
+        let viewport = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(800.0, 600.0));
+        let constraints = PanelConstraints {
+            margin: 10.0,
+            ..Default::default()
+        };
+
+        // Panel positioned off the bottom edge
+        let desired = Rect::from_min_size(Pos2::new(200.0, 500.0), egui::vec2(200.0, 200.0));
+        let result = constrain_rect_to_viewport(desired, viewport, &constraints);
+
+        assert!(result.was_repositioned);
+        // Should be moved up to fit
+        assert!(result.pos.y + result.size.y <= 590.0); // 600 - 10
+    }
+
+    #[test]
+    fn test_constrain_rect_respects_min_size() {
+        let viewport = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(800.0, 600.0));
+        let constraints = PanelConstraints {
+            min_width: 300.0,
+            min_height: 200.0,
+            ..Default::default()
+        };
+
+        // Panel smaller than minimum - should be enlarged
+        let desired = Rect::from_center_size(viewport.center(), egui::vec2(100.0, 100.0));
+        let result = constrain_rect_to_viewport(desired, viewport, &constraints);
+
+        assert!(result.was_resized);
+        assert!(result.size.x >= 300.0);
+        assert!(result.size.y >= 200.0);
+    }
+
+    #[test]
+    fn test_center_panel_in_viewport() {
+        let viewport = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(800.0, 600.0));
+        let constraints = PanelConstraints::default();
+        let panel_size = egui::vec2(400.0, 300.0);
+
+        let result = center_panel_in_viewport(viewport, panel_size, &constraints);
+
+        // Should be centered
+        let center = Pos2::new(result.pos.x + result.size.x / 2.0, result.pos.y + result.size.y / 2.0);
+        let viewport_center = viewport.center();
+        assert!((center.x - viewport_center.x).abs() < 1.0);
+        assert!((center.y - viewport_center.y).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_search_panel_constraints() {
+        let constraints = search_panel_constraints();
+        assert!(constraints.min_width > 0.0);
+        assert!(constraints.max_width > constraints.min_width);
+        assert!(constraints.min_height > 0.0);
+        assert!(constraints.max_height > constraints.min_height);
+        assert!(constraints.margin > 0.0);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Window Resize Tests
+    // ─────────────────────────────────────────────────────────────────────────
 
     #[test]
     fn test_detect_corners() {

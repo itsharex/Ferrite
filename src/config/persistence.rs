@@ -401,8 +401,8 @@ mod tests {
             show_line_numbers: false,
             word_wrap: false,
             tab_size: 2,
-            auto_save: true,
-            auto_save_interval_secs: 30,
+            auto_save_enabled_default: true,
+            auto_save_delay_ms: 30000,
             ..Settings::default()
         };
 

@@ -18,6 +18,7 @@ mod state;
 mod string_utils;
 mod theme;
 mod ui;
+mod vcs;
 mod workspaces;
 
 use app::FerriteApp;

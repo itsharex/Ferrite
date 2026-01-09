@@ -54,6 +54,9 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install cargo-deb
+        run: cargo install cargo-deb
+
       - name: Build release
         run: cargo build --release
 
@@ -63,11 +66,23 @@ jobs:
           cp target/release/ferrite release/
           tar -czvf ferrite-linux-x64.tar.gz -C release .
 
-      - name: Upload artifact
+      - name: Build .deb package
+        run: cargo deb --no-build
+
+      - name: Copy .deb to workspace root
+        run: cp target/debian/*.deb ./ferrite-editor_amd64.deb
+
+      - name: Upload tar.gz artifact
         uses: actions/upload-artifact@v4
         with:
           name: ferrite-linux-x64
           path: ferrite-linux-x64.tar.gz
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ferrite-linux-deb
+          path: ferrite-editor_amd64.deb
 
   build-macos:
     name: Build macOS
@@ -114,6 +129,11 @@ jobs:
         with:
           name: ferrite-linux-x64
 
+      - name: Download Linux .deb artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ferrite-linux-deb
+
       - name: Download macOS artifact
         uses: actions/download-artifact@v4
         with:
@@ -129,4 +149,5 @@ jobs:
           files: |
             ferrite-windows-x64.zip
             ferrite-linux-x64.tar.gz
+            ferrite-editor_amd64.deb
             ferrite-macos-x64.tar.gz

@@ -2500,6 +2500,613 @@ impl<'a> RenderedLinkWidget<'a> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Mermaid Diagram Widget
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The type of Mermaid diagram detected from source.
+///
+/// MermaidJS supports various diagram types, each with its own syntax.
+/// This enum helps identify the diagram type for display purposes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MermaidDiagramType {
+    /// Flowchart diagrams (flowchart, graph)
+    Flowchart,
+    /// Sequence diagrams
+    Sequence,
+    /// Class diagrams
+    Class,
+    /// State diagrams
+    State,
+    /// Entity-Relationship diagrams
+    EntityRelationship,
+    /// User Journey diagrams
+    UserJourney,
+    /// Gantt charts
+    Gantt,
+    /// Pie charts
+    Pie,
+    /// Quadrant charts
+    Quadrant,
+    /// Requirement diagrams
+    Requirement,
+    /// Git graph diagrams
+    GitGraph,
+    /// C4 diagrams
+    C4,
+    /// Mindmap diagrams
+    Mindmap,
+    /// Timeline diagrams
+    Timeline,
+    /// ZenUML diagrams
+    ZenUML,
+    /// Sankey diagrams
+    Sankey,
+    /// XY charts
+    XYChart,
+    /// Block diagrams
+    Block,
+    /// Unknown or unrecognized diagram type
+    Unknown,
+}
+
+impl MermaidDiagramType {
+    /// Get a human-readable display name for the diagram type.
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            Self::Flowchart => "Flowchart",
+            Self::Sequence => "Sequence Diagram",
+            Self::Class => "Class Diagram",
+            Self::State => "State Diagram",
+            Self::EntityRelationship => "Entity-Relationship Diagram",
+            Self::UserJourney => "User Journey",
+            Self::Gantt => "Gantt Chart",
+            Self::Pie => "Pie Chart",
+            Self::Quadrant => "Quadrant Chart",
+            Self::Requirement => "Requirement Diagram",
+            Self::GitGraph => "Git Graph",
+            Self::C4 => "C4 Diagram",
+            Self::Mindmap => "Mindmap",
+            Self::Timeline => "Timeline",
+            Self::ZenUML => "ZenUML Diagram",
+            Self::Sankey => "Sankey Diagram",
+            Self::XYChart => "XY Chart",
+            Self::Block => "Block Diagram",
+            Self::Unknown => "Diagram",
+        }
+    }
+
+    /// Get an icon/emoji representing the diagram type.
+    /// Uses simple single-codepoint characters to avoid rendering issues.
+    pub fn icon(&self) -> &'static str {
+        match self {
+            Self::Flowchart => "📊",
+            Self::Sequence => "⇆",      // Simple bidirectional arrow (no variation selector)
+            Self::Class => "◇",         // Diamond shape for class diagrams
+            Self::State => "⟳",         // Circular arrow for state
+            Self::EntityRelationship => "🔗",
+            Self::UserJourney => "👤",   // Person silhouette
+            Self::Gantt => "📅",
+            Self::Pie => "◔",           // Circle with quarter fill for pie charts
+            Self::Quadrant => "📐",
+            Self::Requirement => "📋",
+            Self::GitGraph => "🌳",
+            Self::C4 => "🏢",
+            Self::Mindmap => "💭",       // Thought bubble for mindmap
+            Self::Timeline => "⏳",
+            Self::ZenUML => "📦",
+            Self::Sankey => "≋",        // Triple tilde for flow/sankey
+            Self::XYChart => "📈",
+            Self::Block => "▦",         // Grid pattern for blocks
+            Self::Unknown => "📊",
+        }
+    }
+}
+
+/// Detect the diagram type from mermaid source code.
+///
+/// Parses the first non-empty, non-comment line to identify the diagram type.
+/// MermaidJS diagram definitions start with a keyword indicating the type.
+///
+/// # Examples
+/// ```ignore
+/// let diagram_type = detect_mermaid_diagram_type("flowchart TD\n  A --> B");
+/// assert_eq!(diagram_type, MermaidDiagramType::Flowchart);
+/// ```
+pub fn detect_mermaid_diagram_type(source: &str) -> MermaidDiagramType {
+    // Find the first non-empty, non-comment line
+    let first_line = source
+        .lines()
+        .map(|line| line.trim())
+        .find(|line| !line.is_empty() && !line.starts_with("%%"))
+        .unwrap_or("");
+
+    let first_line_lower = first_line.to_lowercase();
+
+    // Check for diagram type keywords
+    if first_line_lower.starts_with("flowchart")
+        || first_line_lower.starts_with("graph")
+        || first_line_lower.starts_with("flowchart-v2")
+    {
+        MermaidDiagramType::Flowchart
+    } else if first_line_lower.starts_with("sequencediagram")
+        || first_line_lower.starts_with("sequence")
+    {
+        MermaidDiagramType::Sequence
+    } else if first_line_lower.starts_with("classdiagram")
+        || first_line_lower.starts_with("class")
+    {
+        MermaidDiagramType::Class
+    } else if first_line_lower.starts_with("statediagram")
+        || first_line_lower.starts_with("state")
+    {
+        MermaidDiagramType::State
+    } else if first_line_lower.starts_with("erdiagram") || first_line_lower.starts_with("er") {
+        MermaidDiagramType::EntityRelationship
+    } else if first_line_lower.starts_with("journey") {
+        MermaidDiagramType::UserJourney
+    } else if first_line_lower.starts_with("gantt") {
+        MermaidDiagramType::Gantt
+    } else if first_line_lower.starts_with("pie") {
+        MermaidDiagramType::Pie
+    } else if first_line_lower.starts_with("quadrantchart") {
+        MermaidDiagramType::Quadrant
+    } else if first_line_lower.starts_with("requirementdiagram")
+        || first_line_lower.starts_with("requirement")
+    {
+        MermaidDiagramType::Requirement
+    } else if first_line_lower.starts_with("gitgraph") {
+        MermaidDiagramType::GitGraph
+    } else if first_line_lower.starts_with("c4") {
+        MermaidDiagramType::C4
+    } else if first_line_lower.starts_with("mindmap") {
+        MermaidDiagramType::Mindmap
+    } else if first_line_lower.starts_with("timeline") {
+        MermaidDiagramType::Timeline
+    } else if first_line_lower.starts_with("zenuml") {
+        MermaidDiagramType::ZenUML
+    } else if first_line_lower.starts_with("sankey") {
+        MermaidDiagramType::Sankey
+    } else if first_line_lower.starts_with("xychart") {
+        MermaidDiagramType::XYChart
+    } else if first_line_lower.starts_with("block") {
+        MermaidDiagramType::Block
+    } else {
+        MermaidDiagramType::Unknown
+    }
+}
+
+/// Data for a mermaid diagram block.
+#[derive(Debug, Clone)]
+pub struct MermaidBlockData {
+    /// The mermaid source code
+    pub source: String,
+    /// Detected diagram type
+    pub diagram_type: MermaidDiagramType,
+    /// Whether the block is expanded to show source
+    pub show_source: bool,
+    /// Cached SVG output from rendering (if available)
+    pub rendered_svg: Option<String>,
+    /// Error message if rendering failed
+    pub render_error: Option<String>,
+    /// Whether we're currently rendering
+    pub is_rendering: bool,
+    /// Original source (to detect changes)
+    original_source: String,
+}
+
+impl MermaidBlockData {
+    /// Create new mermaid block data from source.
+    pub fn new(source: impl Into<String>) -> Self {
+        let source = source.into();
+        let diagram_type = detect_mermaid_diagram_type(&source);
+        Self {
+            original_source: source.clone(),
+            source,
+            diagram_type,
+            show_source: false, // Default to rendered diagram view
+            rendered_svg: None,
+            render_error: None,
+            is_rendering: false,
+        }
+    }
+
+    /// Check if the source has been modified.
+    pub fn is_modified(&self) -> bool {
+        self.source != self.original_source
+    }
+
+    /// Mark the current state as saved.
+    pub fn mark_saved(&mut self) {
+        self.original_source = self.source.clone();
+    }
+
+    /// Convert to markdown (code block format).
+    pub fn to_markdown(&self) -> String {
+        format!("```mermaid\n{}\n```", self.source)
+    }
+
+    /// Update the diagram type based on current source.
+    pub fn update_diagram_type(&mut self) {
+        self.diagram_type = detect_mermaid_diagram_type(&self.source);
+    }
+}
+
+/// Output from the mermaid block widget.
+#[derive(Debug, Clone)]
+pub struct MermaidBlockOutput {
+    /// Whether the content was modified
+    pub changed: bool,
+    /// The mermaid source code
+    pub source: String,
+    /// The markdown representation
+    pub markdown: String,
+    /// Detected diagram type
+    pub diagram_type: MermaidDiagramType,
+}
+
+/// A widget for displaying and editing mermaid diagrams.
+///
+/// This widget renders mermaid source code with:
+/// - Diagram type detection and display
+/// - Syntax-highlighted source view
+/// - Visual distinction from regular code blocks
+/// - Toggle between source and rendered views (when rendering available)
+///
+/// # Example
+///
+/// ```ignore
+/// let mut data = MermaidBlockData::new("flowchart TD\n  A --> B");
+///
+/// let output = MermaidBlock::new(&mut data)
+///     .font_size(14.0)
+///     .dark_mode(true)
+///     .show(ui);
+///
+/// if output.changed {
+///     // Handle changes
+/// }
+/// ```
+pub struct MermaidBlock<'a> {
+    /// The mermaid block data
+    data: &'a mut MermaidBlockData,
+    /// Font size for the source code
+    font_size: f32,
+    /// Whether dark mode is active
+    dark_mode: bool,
+    /// Colors for styling
+    colors: Option<WidgetColors>,
+    /// Unique ID for this block
+    id: Option<egui::Id>,
+}
+
+impl<'a> MermaidBlock<'a> {
+    /// Create a new mermaid block widget.
+    pub fn new(data: &'a mut MermaidBlockData) -> Self {
+        Self {
+            data,
+            font_size: 14.0,
+            dark_mode: false,
+            colors: None,
+            id: None,
+        }
+    }
+
+    /// Set the font size.
+    #[must_use]
+    pub fn font_size(mut self, size: f32) -> Self {
+        self.font_size = size;
+        self
+    }
+
+    /// Set dark mode.
+    #[must_use]
+    pub fn dark_mode(mut self, dark: bool) -> Self {
+        self.dark_mode = dark;
+        self
+    }
+
+    /// Set the widget colors.
+    #[must_use]
+    pub fn colors(mut self, colors: WidgetColors) -> Self {
+        self.colors = Some(colors);
+        self
+    }
+
+    /// Set a custom ID for the block.
+    #[must_use]
+    pub fn id(mut self, id: egui::Id) -> Self {
+        self.id = Some(id);
+        self
+    }
+
+    /// Show the mermaid block widget and return the output.
+    pub fn show(self, ui: &mut Ui) -> MermaidBlockOutput {
+        use crate::markdown::mermaid::{render_mermaid_diagram, RenderResult};
+
+        let _colors = self
+            .colors
+            .unwrap_or_else(|| WidgetColors::from_theme(Theme::Light, ui.visuals()));
+
+        // Use the provided ID or generate one
+        let block_id = self.id.unwrap_or_else(|| egui::Id::new("mermaid_block"));
+
+        // Track original source for change detection
+        let original_source = self.data.source.clone();
+
+        // Update diagram type if source changed
+        if self.data.is_modified() {
+            self.data.update_diagram_type();
+        }
+
+        // Styling based on dark mode
+        let bg_color = if self.dark_mode {
+            egui::Color32::from_rgb(35, 45, 55)
+        } else {
+            egui::Color32::from_rgb(240, 245, 250)
+        };
+
+        let border_color = if self.dark_mode {
+            egui::Color32::from_rgb(60, 100, 140)
+        } else {
+            egui::Color32::from_rgb(150, 180, 210)
+        };
+
+        let header_bg = if self.dark_mode {
+            egui::Color32::from_rgb(45, 60, 75)
+        } else {
+            egui::Color32::from_rgb(220, 235, 250)
+        };
+
+        let text_color = if self.dark_mode {
+            egui::Color32::from_rgb(200, 210, 220)
+        } else {
+            egui::Color32::from_rgb(40, 50, 60)
+        };
+
+        let muted_color = if self.dark_mode {
+            egui::Color32::from_rgb(140, 150, 160)
+        } else {
+            egui::Color32::from_rgb(100, 110, 120)
+        };
+
+        let accent_color = if self.dark_mode {
+            egui::Color32::from_rgb(100, 160, 220)
+        } else {
+            egui::Color32::from_rgb(30, 100, 170)
+        };
+
+        // Main frame
+        let frame = egui::Frame::none()
+            .fill(bg_color)
+            .stroke(egui::Stroke::new(1.5, border_color))
+            .rounding(egui::Rounding::same(6.0))
+            .inner_margin(egui::Margin::same(0.0));
+
+        frame.show(ui, |ui| {
+            ui.vertical(|ui| {
+                // Header with diagram type indicator
+                let header_frame = egui::Frame::none()
+                    .fill(header_bg)
+                    .rounding(egui::Rounding {
+                        nw: 6.0,
+                        ne: 6.0,
+                        sw: 0.0,
+                        se: 0.0,
+                    })
+                    .inner_margin(egui::Margin::symmetric(12.0, 8.0));
+
+                header_frame.show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        // Diagram type icon and name
+                        ui.label(
+                            RichText::new(self.data.diagram_type.icon())
+                                .size(self.font_size + 2.0),
+                        );
+                        ui.label(
+                            RichText::new(self.data.diagram_type.display_name())
+                                .color(accent_color)
+                                .strong()
+                                .size(self.font_size),
+                        );
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            // Mermaid badge
+                            ui.label(
+                                RichText::new("mermaid")
+                                    .color(muted_color)
+                                    .italics()
+                                    .size(self.font_size - 2.0),
+                            );
+
+                            // Toggle source view button
+                            let toggle_text = if self.data.show_source {
+                                "▼ Source"
+                            } else {
+                                "▶ Source"
+                            };
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new(toggle_text)
+                                            .color(text_color)
+                                            .size(self.font_size - 2.0),
+                                    )
+                                    .frame(false),
+                                )
+                                .clicked()
+                            {
+                                self.data.show_source = !self.data.show_source;
+                            }
+                        });
+                    });
+                });
+
+                // Content area - show rendered diagram or source
+                let content_frame = egui::Frame::none()
+                    .inner_margin(egui::Margin::symmetric(12.0, 8.0));
+
+                content_frame.show(ui, |ui| {
+                    if self.data.show_source {
+                        // Show source code
+                        show_source_code(ui, block_id, &self.data.source, self.font_size, self.dark_mode, muted_color);
+                    } else if self.data.source.trim().is_empty() {
+                        // Empty diagram
+                        ui.label(
+                            RichText::new("(empty diagram)")
+                                .color(muted_color)
+                                .italics()
+                                .font(FontId::monospace(self.font_size)),
+                        );
+                    } else {
+                        // Render diagram natively
+                        let result = render_mermaid_diagram(ui, &self.data.source, self.dark_mode, self.font_size);
+                        
+                        match result {
+                            RenderResult::Success => {
+                                // Diagram rendered successfully
+                            }
+                            RenderResult::ParseError(msg) => {
+                                // Show parse error
+                                show_render_error(ui, &msg, muted_color, self.font_size, self.dark_mode);
+                                ui.add_space(8.0);
+                                show_source_code(ui, block_id, &self.data.source, self.font_size, self.dark_mode, muted_color);
+                            }
+                            RenderResult::Unsupported(msg) => {
+                                // Show unsupported message with source
+                                ui.vertical_centered(|ui| {
+                                    ui.label(
+                                        RichText::new("🚧")
+                                            .size(self.font_size * 2.0),
+                                    );
+                                    ui.add_space(4.0);
+                                    ui.label(
+                                        RichText::new(&msg)
+                                            .color(accent_color)
+                                            .size(self.font_size),
+                                    );
+                                });
+                                ui.add_space(8.0);
+                                show_source_code(ui, block_id, &self.data.source, self.font_size, self.dark_mode, muted_color);
+                            }
+                        }
+                    }
+                });
+
+                // Render error display (if any stored in data)
+                if let Some(error) = &self.data.render_error {
+                    let error_frame = egui::Frame::none()
+                        .fill(if self.dark_mode {
+                            egui::Color32::from_rgb(60, 30, 30)
+                        } else {
+                            egui::Color32::from_rgb(255, 240, 240)
+                        })
+                        .inner_margin(egui::Margin::symmetric(12.0, 8.0));
+
+                    error_frame.show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("⚠").color(egui::Color32::from_rgb(220, 80, 80)));
+                            ui.label(
+                                RichText::new(error)
+                                    .color(if self.dark_mode {
+                                        egui::Color32::from_rgb(255, 180, 180)
+                                    } else {
+                                        egui::Color32::from_rgb(180, 50, 50)
+                                    })
+                                    .size(self.font_size - 1.0),
+                            );
+                        });
+                    });
+                }
+            });
+        });
+
+        // Check for changes
+        let changed = self.data.source != original_source;
+
+        MermaidBlockOutput {
+            changed,
+            source: self.data.source.clone(),
+            markdown: self.data.to_markdown(),
+            diagram_type: self.data.diagram_type,
+        }
+    }
+}
+
+/// Show source code with syntax highlighting.
+fn show_source_code(
+    ui: &mut Ui,
+    block_id: egui::Id,
+    source: &str,
+    font_size: f32,
+    dark_mode: bool,
+    muted_color: egui::Color32,
+) {
+    use crate::markdown::syntax::highlight_code;
+    
+    let lines = highlight_code(source, "mermaid", dark_mode);
+
+    egui::ScrollArea::vertical()
+        .id_source(block_id.with("scroll"))
+        .max_height(300.0)
+        .show(ui, |ui| {
+            ui.vertical(|ui| {
+                if lines.is_empty() {
+                    ui.label(
+                        RichText::new("(empty diagram)")
+                            .color(muted_color)
+                            .italics()
+                            .font(FontId::monospace(font_size)),
+                    );
+                } else {
+                    for line in &lines {
+                        ui.horizontal(|ui| {
+                            for segment in &line.segments {
+                                ui.label(segment.to_rich_text(font_size));
+                            }
+                        });
+                    }
+                }
+            });
+        });
+}
+
+/// Show render error message.
+fn show_render_error(
+    ui: &mut Ui,
+    error: &str,
+    _muted_color: egui::Color32,
+    font_size: f32,
+    dark_mode: bool,
+) {
+    let error_bg = if dark_mode {
+        egui::Color32::from_rgb(60, 40, 40)
+    } else {
+        egui::Color32::from_rgb(255, 245, 245)
+    };
+    
+    let error_text = if dark_mode {
+        egui::Color32::from_rgb(255, 180, 180)
+    } else {
+        egui::Color32::from_rgb(180, 50, 50)
+    };
+    
+    egui::Frame::none()
+        .fill(error_bg)
+        .rounding(4.0)
+        .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("⚠").color(error_text));
+                ui.label(
+                    RichText::new(format!("Render failed: {}", error))
+                        .color(error_text)
+                        .size(font_size - 1.0),
+                );
+            });
+        });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -3143,5 +3750,191 @@ mod tests {
         assert!(output.is_autolink);
         // For autolinks, markdown is just the URL (no [text](url) syntax)
         assert_eq!(output.markdown, "https://example.com");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Mermaid Diagram Tests
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_detect_mermaid_flowchart() {
+        assert_eq!(
+            detect_mermaid_diagram_type("flowchart TD\n  A --> B"),
+            MermaidDiagramType::Flowchart
+        );
+        assert_eq!(
+            detect_mermaid_diagram_type("graph LR\n  A --> B"),
+            MermaidDiagramType::Flowchart
+        );
+        assert_eq!(
+            detect_mermaid_diagram_type("FLOWCHART TB\n  Start --> End"),
+            MermaidDiagramType::Flowchart
+        );
+    }
+
+    #[test]
+    fn test_detect_mermaid_sequence() {
+        assert_eq!(
+            detect_mermaid_diagram_type("sequenceDiagram\n  Alice->>Bob: Hello"),
+            MermaidDiagramType::Sequence
+        );
+    }
+
+    #[test]
+    fn test_detect_mermaid_class() {
+        assert_eq!(
+            detect_mermaid_diagram_type("classDiagram\n  Animal <|-- Duck"),
+            MermaidDiagramType::Class
+        );
+    }
+
+    #[test]
+    fn test_detect_mermaid_state() {
+        assert_eq!(
+            detect_mermaid_diagram_type("stateDiagram-v2\n  [*] --> Still"),
+            MermaidDiagramType::State
+        );
+    }
+
+    #[test]
+    fn test_detect_mermaid_er() {
+        assert_eq!(
+            detect_mermaid_diagram_type("erDiagram\n  CUSTOMER ||--o{ ORDER : places"),
+            MermaidDiagramType::EntityRelationship
+        );
+    }
+
+    #[test]
+    fn test_detect_mermaid_journey() {
+        assert_eq!(
+            detect_mermaid_diagram_type("journey\n  title My working day"),
+            MermaidDiagramType::UserJourney
+        );
+    }
+
+    #[test]
+    fn test_detect_mermaid_gantt() {
+        assert_eq!(
+            detect_mermaid_diagram_type("gantt\n  title A Gantt Diagram"),
+            MermaidDiagramType::Gantt
+        );
+    }
+
+    #[test]
+    fn test_detect_mermaid_pie() {
+        assert_eq!(
+            detect_mermaid_diagram_type("pie title Pets\n  \"Dogs\" : 386"),
+            MermaidDiagramType::Pie
+        );
+    }
+
+    #[test]
+    fn test_detect_mermaid_gitgraph() {
+        assert_eq!(
+            detect_mermaid_diagram_type("gitGraph\n  commit"),
+            MermaidDiagramType::GitGraph
+        );
+    }
+
+    #[test]
+    fn test_detect_mermaid_mindmap() {
+        assert_eq!(
+            detect_mermaid_diagram_type("mindmap\n  root((mindmap))"),
+            MermaidDiagramType::Mindmap
+        );
+    }
+
+    #[test]
+    fn test_detect_mermaid_timeline() {
+        assert_eq!(
+            detect_mermaid_diagram_type("timeline\n  title History of Events"),
+            MermaidDiagramType::Timeline
+        );
+    }
+
+    #[test]
+    fn test_detect_mermaid_unknown() {
+        assert_eq!(
+            detect_mermaid_diagram_type("unknown diagram type"),
+            MermaidDiagramType::Unknown
+        );
+        assert_eq!(
+            detect_mermaid_diagram_type(""),
+            MermaidDiagramType::Unknown
+        );
+    }
+
+    #[test]
+    fn test_detect_mermaid_with_comments() {
+        // Should skip %% comment lines
+        assert_eq!(
+            detect_mermaid_diagram_type("%% This is a comment\nflowchart TD\n  A --> B"),
+            MermaidDiagramType::Flowchart
+        );
+    }
+
+    #[test]
+    fn test_mermaid_block_data_new() {
+        let data = MermaidBlockData::new("flowchart TD\n  A --> B");
+        assert_eq!(data.diagram_type, MermaidDiagramType::Flowchart);
+        assert!(!data.is_modified());
+        assert!(!data.show_source); // Default to rendered diagram view
+        assert!(data.rendered_svg.is_none());
+        assert!(data.render_error.is_none());
+    }
+
+    #[test]
+    fn test_mermaid_block_data_modification_detection() {
+        let mut data = MermaidBlockData::new("flowchart TD\n  A --> B");
+        assert!(!data.is_modified());
+
+        data.source = "flowchart TD\n  A --> C".to_string();
+        assert!(data.is_modified());
+
+        data.mark_saved();
+        assert!(!data.is_modified());
+    }
+
+    #[test]
+    fn test_mermaid_block_data_to_markdown() {
+        let data = MermaidBlockData::new("flowchart TD\n  A --> B");
+        assert_eq!(data.to_markdown(), "```mermaid\nflowchart TD\n  A --> B\n```");
+    }
+
+    #[test]
+    fn test_mermaid_block_data_update_diagram_type() {
+        let mut data = MermaidBlockData::new("flowchart TD\n  A --> B");
+        assert_eq!(data.diagram_type, MermaidDiagramType::Flowchart);
+
+        data.source = "sequenceDiagram\n  Alice->>Bob: Hello".to_string();
+        data.update_diagram_type();
+        assert_eq!(data.diagram_type, MermaidDiagramType::Sequence);
+    }
+
+    #[test]
+    fn test_mermaid_diagram_type_display_name() {
+        assert_eq!(MermaidDiagramType::Flowchart.display_name(), "Flowchart");
+        assert_eq!(MermaidDiagramType::Sequence.display_name(), "Sequence Diagram");
+        assert_eq!(MermaidDiagramType::Class.display_name(), "Class Diagram");
+        assert_eq!(MermaidDiagramType::Unknown.display_name(), "Diagram");
+    }
+
+    #[test]
+    fn test_mermaid_diagram_type_icon() {
+        assert!(!MermaidDiagramType::Flowchart.icon().is_empty());
+        assert!(!MermaidDiagramType::Sequence.icon().is_empty());
+        assert!(!MermaidDiagramType::Unknown.icon().is_empty());
+    }
+
+    #[test]
+    fn test_mermaid_block_output_fields() {
+        let output = MermaidBlockOutput {
+            changed: true,
+            source: "flowchart TD\n  A --> B".to_string(),
+            markdown: "```mermaid\nflowchart TD\n  A --> B\n```".to_string(),
+            diagram_type: MermaidDiagramType::Flowchart,
+        };
+        assert!(output.changed);
+        assert_eq!(output.diagram_type, MermaidDiagramType::Flowchart);
     }
 }

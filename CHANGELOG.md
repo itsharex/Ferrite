@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2025-01-09
+
+### Added
+
+#### Major Features
+- **Split View** - Side-by-side raw editor and rendered preview with resizable divider and per-tab split ratio persistence
+- **MermaidJS Native Rendering** - 11 diagram types rendered natively in Rust/egui (flowchart, sequence, pie, state, mindmap, class, ER, git graph, gantt, timeline, user journey)
+- **Editor Minimap** - VS Code-style scaled preview with click-to-navigate, viewport indicator, and search highlights visible in minimap
+- **Code Folding** - Fold detection for headings, code blocks, and lists with gutter indicators (▶/▼) and indentation-based folding for JSON/YAML
+- **Live Pipeline Panel** - Pipe JSON/YAML content through shell commands with real-time output preview and command history
+- **Zen Mode** - Distraction-free writing with centered text column and configurable column width
+- **Git Integration** - Visual status indicators in file tree showing modified, added, untracked, and ignored files (using git2 library)
+- **Auto-Save** - Configurable delay (default 15s), per-tab toggle, temp-file based for safety
+- **Session Persistence** - Restore open tabs on restart with cursor position, scroll offset, view mode, and per-tab split ratio
+- **Bracket Matching** - Highlight matching brackets `()[]{}<>` and markdown emphasis pairs `**` and `__` with theme-aware colors
+
+### Fixed
+- **Rendered Mode List Editing** - Fixed item index mapping issues, proper structural key hashing, and edit state consistency (Tasks 64-69)
+- **Light Mode Contrast** - Improved text and border visibility with WCAG AA compliant contrast ratios, added separator between tabs and editor
+- **Scroll Synchronization** - Bidirectional sync between Raw and Rendered modes with hybrid line-based/percentage approach and mode switch scroll preservation
+- **Search-in-Files Navigation** - Click result now scrolls to match with transient highlight that auto-clears on scroll or edit
+- **Search Panel Viewport** - Fixed top and bottom clipping issues with proper bounds calculation
+
+### Changed
+- **Tab Context Menu** - Reorganized icons with logical grouping for better visual clarity
+
+### Technical
+- Added ~4000 lines of Mermaid rendering code in `src/markdown/mermaid.rs`
+- New modules: `src/vcs/` for git integration, `src/editor/minimap.rs`, `src/editor/folding.rs`, `src/editor/matching.rs`, `src/ui/pipeline.rs`, `src/config/session.rs`
+- Comprehensive technical documentation for all major features in `docs/technical/`
+
+### Deferred
+- **Multi-cursor editing** (Task 72) - Deferred to v0.3.0, requires custom text editor implementation
+
 ## [0.1.0] - 2025-01-XX
 
 ### Added
@@ -80,7 +114,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Version History
 
+- **0.2.0** - Major feature release (Split View, Mermaid, Minimap, Git integration, and more)
 - **0.1.0** - Initial public release
 
-[Unreleased]: https://github.com/OlaProeis/Ferrite/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/OlaProeis/Ferrite/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/OlaProeis/Ferrite/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/OlaProeis/Ferrite/releases/tag/v0.1.0

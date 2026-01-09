@@ -13,8 +13,8 @@
 
 use crate::config::{Settings, Theme, ViewMode, WindowSize};
 use crate::editor::{
-    extract_outline_for_file, DocumentOutline, EditorWidget, FindReplacePanel, SearchHighlights,
-    TextStats,
+    extract_outline_for_file, DocumentOutline, EditorWidget, FindReplacePanel, Minimap,
+    SearchHighlights, TextStats,
 };
 use crate::export::{copy_html_to_clipboard, generate_html_document};
 use crate::files::dialogs::{open_multiple_files_dialog, save_file_dialog};
@@ -23,13 +23,16 @@ use crate::markdown::{
     apply_raw_format, detect_raw_formatting_state, get_structured_file_type, EditorMode,
     FormattingState, MarkdownEditor, MarkdownFormatCommand, TreeViewer, TreeViewerState,
 };
-use crate::preview::{ScrollOrigin, SyncScrollState};
+// Note: SyncScrollState is available for future split-view sync scrolling
+#[allow(unused_imports)]
+use crate::preview::SyncScrollState;
 use crate::state::{AppState, FileType, PendingAction};
 use crate::theme::{ThemeColors, ThemeManager};
 use crate::ui::{
     handle_window_resize, AboutPanel, FileOperationDialog, FileOperationResult,
     FileTreeContextAction, FileTreePanel, OutlinePanel, QuickSwitcher, Ribbon, RibbonAction,
-    SearchPanel, SettingsPanel, WindowResizeState,
+    SearchNavigationTarget, SearchPanel, SettingsPanel, TitleBarButton, ViewModeSegment,
+    ViewSegmentAction, WindowResizeState,
 };
 use eframe::egui;
 use log::{debug, info, warn};
@@ -75,8 +78,6 @@ enum KeyboardAction {
     FindNext,
     /// Find previous match (Shift+F3)
     FindPrev,
-    /// Close find panel (Escape)
-    CloseFindPanel,
     /// Apply markdown formatting
     Format(MarkdownFormatCommand),
     /// Toggle outline panel (Ctrl+Shift+O)
@@ -91,6 +92,35 @@ enum KeyboardAction {
     ExportHtml,
     /// Open about/help panel (F1)
     OpenAbout,
+    /// Select next occurrence of current word/selection (Ctrl+D)
+    SelectNextOccurrence,
+    /// Exit multi-cursor mode (Escape when multi-cursor active)
+    ExitMultiCursor,
+    /// Toggle Zen Mode (F11)
+    ToggleZenMode,
+    /// Fold all regions (Ctrl+Shift+[)
+    FoldAll,
+    /// Unfold all regions (Ctrl+Shift+])
+    UnfoldAll,
+    /// Toggle fold at cursor (Ctrl+Shift+.)
+    ToggleFoldAtCursor,
+    /// Toggle Live Pipeline panel (Ctrl+Shift+L)
+    TogglePipeline,
+}
+
+/// Information about a pending auto-save recovery for user confirmation.
+#[derive(Debug, Clone)]
+struct AutoSaveRecoveryInfo {
+    /// Tab ID that has recovery available
+    tab_id: usize,
+    /// Tab index in the tabs array
+    tab_index: usize,
+    /// File path (if any)
+    path: Option<std::path::PathBuf>,
+    /// Recovered content from auto-save
+    recovered_content: String,
+    /// Timestamp when auto-save was created
+    saved_at: u64,
 }
 
 /// The main application struct that holds all state and implements eframe::App.
@@ -117,6 +147,8 @@ pub struct FerriteApp {
     file_operation_dialog: Option<FileOperationDialog>,
     /// Search in files panel (Ctrl+Shift+F)
     search_panel: SearchPanel,
+    /// Live Pipeline panel for JSON/YAML command piping
+    pipeline_panel: crate::ui::PipelinePanel,
     /// Cached document outline (updated when content changes)
     cached_outline: DocumentOutline,
     /// Hash of the last content used to generate outline (for change detection)
@@ -126,6 +158,8 @@ pub struct FerriteApp {
     /// Tree viewer states per tab (keyed by tab ID)
     tree_viewer_states: HashMap<usize, TreeViewerState>,
     /// Sync scroll states per tab (keyed by tab ID)
+    /// Note: Reserved for future split-view bidirectional sync scrolling
+    #[allow(dead_code)]
     sync_scroll_states: HashMap<usize, SyncScrollState>,
     /// Track if we should exit (after confirmation)
     should_exit: bool,
@@ -140,20 +174,52 @@ pub struct FerriteApp {
     previous_view_mode: Option<ViewMode>,
     /// Window resize state for borderless window edge dragging
     window_resize_state: WindowResizeState,
+    /// Session save throttle for crash recovery persistence
+    session_save_throttle: crate::config::SessionSaveThrottle,
+    /// Whether we're showing the crash recovery dialog
+    show_recovery_dialog: bool,
+    /// Pending session restore result (set on startup if crash recovery detected)
+    pending_recovery: Option<crate::config::SessionRestoreResult>,
+    /// Pending auto-save recovery info (for showing recovery dialog)
+    pending_auto_save_recovery: Option<AutoSaveRecoveryInfo>,
 }
 
 impl FerriteApp {
     /// Create a new FerriteApp instance.
     ///
     /// This initializes the application state from the config file and applies
-    /// the saved theme preference.
+    /// the saved theme preference. It also checks for crash recovery and
+    /// restores the previous session if needed.
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        use crate::config::{create_lock_file, load_session_state, SessionSaveThrottle};
+
         info!("Initializing Ferrite");
+
+        // Create lock file to detect crashes on next startup
+        create_lock_file();
 
         // Set up custom fonts with proper bold/italic variants
         fonts::setup_fonts(&cc.egui_ctx);
 
-        let state = AppState::new();
+        // Set snappy/instant animations (default is ~83ms, we want instant)
+        let mut style = (*cc.egui_ctx.style()).clone();
+        style.animation_time = 0.0; // Instant - no animations
+        cc.egui_ctx.set_style(style);
+
+        // Check for crash recovery before creating AppState
+        let recovery_result = load_session_state();
+        let needs_recovery_dialog = recovery_result.is_crash_recovery 
+            && recovery_result.session.as_ref().map(|s| s.has_unsaved_changes()).unwrap_or(false);
+
+        let mut state = AppState::new();
+
+        // If we have a valid session to restore (but no crash with unsaved changes),
+        // restore it silently
+        if !needs_recovery_dialog && recovery_result.session.is_some() {
+            if state.restore_from_session_result(&recovery_result) {
+                info!("Session restored successfully");
+            }
+        }
 
         // Initialize theme manager with saved theme preference
         let mut theme_manager = ThemeManager::new(state.settings.theme);
@@ -167,6 +233,25 @@ impl FerriteApp {
             .with_width(state.settings.outline_width)
             .with_side(state.settings.outline_side);
 
+        // Initialize pipeline panel with saved settings
+        let mut pipeline_panel = crate::ui::PipelinePanel::new();
+        pipeline_panel.set_height(state.settings.pipeline_panel_height);
+        pipeline_panel.set_enabled(state.settings.pipeline_enabled);
+        pipeline_panel.configure(
+            state.settings.pipeline_debounce_ms,
+            state.settings.pipeline_max_output_bytes as usize,
+            state.settings.pipeline_max_runtime_ms as u64,
+        );
+        pipeline_panel.set_recent_commands(state.settings.pipeline_recent_commands.clone());
+
+        // Determine if we need to show recovery dialog
+        let (show_recovery_dialog, pending_recovery) = if needs_recovery_dialog {
+            info!("Crash recovery detected with unsaved changes - will prompt user");
+            (true, Some(recovery_result))
+        } else {
+            (false, None)
+        };
+
         Self {
             state,
             theme_manager,
@@ -179,6 +264,7 @@ impl FerriteApp {
             quick_switcher: QuickSwitcher::new(),
             file_operation_dialog: None,
             search_panel: SearchPanel::new(),
+            pipeline_panel,
             cached_outline: DocumentOutline::new(),
             last_outline_content_hash: 0,
             pending_scroll_to_line: None,
@@ -190,6 +276,10 @@ impl FerriteApp {
             start_time: std::time::Instant::now(),
             previous_view_mode: None,
             window_resize_state: WindowResizeState::new(),
+            session_save_throttle: SessionSaveThrottle::default(),
+            show_recovery_dialog,
+            pending_recovery,
+            pending_auto_save_recovery: None,
         }
     }
 
@@ -285,11 +375,321 @@ impl FerriteApp {
         }
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // Session Persistence (Crash Recovery)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Update session recovery state - called every frame.
+    ///
+    /// This checks if enough time has passed since the last session save
+    /// and saves a crash recovery snapshot if needed.
+    fn update_session_recovery(&mut self) {
+        use crate::config::save_crash_recovery_state;
+
+        // Mark session dirty if there are unsaved changes
+        if self.state.has_unsaved_changes() {
+            self.session_save_throttle.mark_dirty();
+        }
+
+        // Check if we should save
+        if self.session_save_throttle.should_save() {
+            let mut session_state = self.state.capture_session_state();
+            session_state.clean_shutdown = false; // This is a crash recovery snapshot
+
+            if save_crash_recovery_state(&session_state) {
+                // Also save recovery content for tabs with unsaved changes
+                self.state.save_recovery_content();
+                self.session_save_throttle.record_save();
+                debug!("Crash recovery snapshot saved");
+            }
+        }
+    }
+
+    /// Mark that session state has changed (for throttled saves).
+    ///
+    /// Call this when tabs are opened, closed, switched, or content changes.
+    #[allow(dead_code)]
+    fn mark_session_dirty(&mut self) {
+        self.session_save_throttle.mark_dirty();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Auto-Save Processing
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Process auto-save for all tabs that need it.
+    ///
+    /// This is called every frame and checks each tab to see if auto-save
+    /// should trigger based on idle time. Uses temp files to avoid
+    /// overwriting the main file prematurely.
+    fn process_auto_saves(&mut self) {
+        use crate::config::save_auto_save_content;
+
+        let delay_ms = self.state.settings.auto_save_delay_ms;
+        let tab_count = self.state.tab_count();
+
+        // Collect tabs that need auto-save (indices and info)
+        let mut tabs_to_save: Vec<(usize, usize, Option<std::path::PathBuf>, String)> = Vec::new();
+        
+        for i in 0..tab_count {
+            if let Some(tab) = self.state.tab(i) {
+                if tab.should_auto_save(delay_ms) {
+                    tabs_to_save.push((i, tab.id, tab.path.clone(), tab.content.clone()));
+                }
+            }
+        }
+
+        // Process auto-saves
+        for (index, tab_id, path, content) in tabs_to_save {
+            // Save to temp file
+            if save_auto_save_content(tab_id, path.as_ref(), &content) {
+                // Mark as auto-saved to prevent repeated saves
+                if let Some(tab) = self.state.tab_mut(index) {
+                    if tab.id == tab_id {
+                        tab.mark_auto_saved();
+                        debug!("Auto-saved tab {} to temp file", tab_id);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Delete auto-save temp file for a tab after manual save.
+    ///
+    /// Called when user manually saves a file to clean up the temp backup.
+    fn cleanup_auto_save_for_tab(&mut self, tab_id: usize) {
+        use crate::config::delete_auto_save;
+
+        // Find the tab by ID to get its path
+        let tab_count = self.state.tab_count();
+        for i in 0..tab_count {
+            if let Some(tab) = self.state.tab(i) {
+                if tab.id == tab_id {
+                    delete_auto_save(tab_id, tab.path.as_ref());
+                    debug!("Cleaned up auto-save temp file for tab {}", tab_id);
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Check for auto-save recovery for a newly opened file.
+    ///
+    /// If an auto-save temp file exists that is newer than the file on disk,
+    /// prompts the user to restore from the auto-save or discard it.
+    ///
+    /// This is called after opening a file to check if there's a recovery available.
+    fn check_auto_save_recovery(&mut self, tab_index: usize) {
+        use crate::config::check_auto_save_recovery;
+
+        let Some(tab) = self.state.tab(tab_index) else {
+            return;
+        };
+
+        let tab_id = tab.id;
+        let path = tab.path.clone();
+
+        // Check if there's a newer auto-save
+        if let Some((metadata, recovered_content)) = check_auto_save_recovery(tab_id, path.as_ref()) {
+            info!(
+                "Found auto-save recovery for tab {} (saved at: {})",
+                tab_id, metadata.saved_at
+            );
+
+            // Store recovery info for showing dialog
+            self.pending_auto_save_recovery = Some(AutoSaveRecoveryInfo {
+                tab_id,
+                tab_index,
+                path: path.clone(),
+                recovered_content,
+                saved_at: metadata.saved_at,
+            });
+        }
+    }
+
+    /// Show auto-save recovery dialog if needed.
+    fn show_auto_save_recovery_dialog(&mut self, ctx: &egui::Context) {
+        use crate::config::delete_auto_save;
+
+        let Some(recovery_info) = self.pending_auto_save_recovery.take() else {
+            return;
+        };
+
+        // Show a modal dialog
+        let mut should_restore = false;
+        let mut should_discard = false;
+
+        egui::Window::new("🔄 Auto-Save Recovery")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.add_space(8.0);
+                ui.label("An auto-saved backup was found for this file.");
+                ui.add_space(4.0);
+
+                if let Some(path) = &recovery_info.path {
+                    ui.label(format!("File: {}", path.display()));
+                } else {
+                    ui.label("Untitled document");
+                }
+
+                // Format timestamp
+                let saved_time = std::time::UNIX_EPOCH
+                    + std::time::Duration::from_secs(recovery_info.saved_at);
+                if let Ok(elapsed) = std::time::SystemTime::now().duration_since(saved_time) {
+                    let secs = elapsed.as_secs();
+                    let time_str = if secs < 60 {
+                        format!("{} seconds ago", secs)
+                    } else if secs < 3600 {
+                        format!("{} minutes ago", secs / 60)
+                    } else if secs < 86400 {
+                        format!("{} hours ago", secs / 3600)
+                    } else {
+                        format!("{} days ago", secs / 86400)
+                    };
+                    ui.label(format!("Auto-saved: {}", time_str));
+                }
+
+                ui.add_space(12.0);
+                ui.label("Would you like to restore the auto-saved content?");
+                ui.add_space(8.0);
+
+                ui.horizontal(|ui| {
+                    if ui.button("✅ Restore").clicked() {
+                        should_restore = true;
+                    }
+                    if ui.button("🗑 Discard").clicked() {
+                        should_discard = true;
+                    }
+                });
+            });
+
+        if should_restore {
+            // Restore the auto-saved content
+            if let Some(tab) = self.state.tab_mut(recovery_info.tab_index) {
+                if tab.id == recovery_info.tab_id {
+                    tab.set_content(recovery_info.recovered_content);
+                    let time = self.get_app_time();
+                    self.state.show_toast("Restored from auto-save".to_string(), time, 3.0);
+                    info!("Restored auto-save content for tab {}", recovery_info.tab_id);
+                }
+            }
+            // Delete the auto-save file after restore
+            delete_auto_save(recovery_info.tab_id, recovery_info.path.as_ref());
+        } else if should_discard {
+            // Delete the auto-save file
+            delete_auto_save(recovery_info.tab_id, recovery_info.path.as_ref());
+            let time = self.get_app_time();
+            self.state.show_toast("Auto-save discarded".to_string(), time, 2.0);
+            info!("Discarded auto-save for tab {}", recovery_info.tab_id);
+        } else {
+            // Dialog still open, put recovery info back
+            self.pending_auto_save_recovery = Some(recovery_info);
+        }
+    }
+
+    /// Show the crash recovery dialog if needed.
+    ///
+    /// This renders a modal dialog asking the user whether to restore
+    /// the previous session with unsaved changes.
+    fn show_recovery_dialog_if_needed(&mut self, ctx: &egui::Context) {
+        use crate::config::clear_all_recovery_data;
+
+        if !self.show_recovery_dialog {
+            return;
+        }
+
+        let Some(recovery_result) = &self.pending_recovery else {
+            self.show_recovery_dialog = false;
+            return;
+        };
+
+        let num_unsaved = recovery_result
+            .session
+            .as_ref()
+            .map(|s| s.tabs_with_unsaved_content().len())
+            .unwrap_or(0);
+
+        let mut restore = false;
+        let mut discard = false;
+
+        egui::Window::new("🔄 Recover Previous Session?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_min_width(400.0);
+
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 8.0;
+
+                    ui.label("Ferrite detected that your previous session was not closed properly.");
+                    ui.add_space(4.0);
+
+                    if num_unsaved > 0 {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(255, 180, 0),
+                            format!(
+                                "⚠ {} tab(s) had unsaved changes that may be recoverable.",
+                                num_unsaved
+                            ),
+                        );
+                    }
+
+                    ui.add_space(8.0);
+
+                    ui.label("Would you like to restore your previous session?");
+
+                    ui.add_space(12.0);
+
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button("✓ Restore Session")
+                            .on_hover_text("Restore all tabs from the previous session")
+                            .clicked()
+                        {
+                            restore = true;
+                        }
+
+                        ui.add_space(8.0);
+
+                        if ui
+                            .button("✗ Start Fresh")
+                            .on_hover_text("Discard the previous session and start with an empty editor")
+                            .clicked()
+                        {
+                            discard = true;
+                        }
+                    });
+                });
+            });
+
+        if restore {
+            if let Some(result) = self.pending_recovery.take() {
+                if self.state.restore_from_session_result(&result) {
+                    info!("Session restored from crash recovery");
+                    let current_time = self.get_app_time();
+                    self.state.show_toast("Session restored", current_time, 3.0);
+                }
+            }
+            // Clear recovery data after successful restore
+            clear_all_recovery_data();
+            self.show_recovery_dialog = false;
+        } else if discard {
+            info!("User discarded crash recovery");
+            clear_all_recovery_data();
+            self.pending_recovery = None;
+            self.show_recovery_dialog = false;
+        }
+    }
+
     /// Render the main UI content.
     /// Returns a deferred format command if one was requested from the ribbon.
     fn render_ui(&mut self, ctx: &egui::Context) -> Option<MarkdownFormatCommand> {
         let is_maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
         let is_dark = ctx.style().visuals.dark_mode;
+        let zen_mode = self.state.is_zen_mode();
 
         // Title bar colors based on theme
         let title_bar_color = if is_dark {
@@ -328,18 +728,48 @@ impl FerriteApp {
                 // Add top padding for title bar
                 ui.add_space(5.0);
 
-                // Title bar row
-                ui.horizontal(|ui| {
+                // Get state needed for title bar controls
+                let has_editor = self.state.active_tab().is_some();
+                let auto_save_enabled = self.state.active_tab()
+                    .map(|t| t.auto_save_enabled)
+                    .unwrap_or(false);
+                let current_view_mode = self.state.active_tab()
+                    .map(|t| t.view_mode)
+                    .unwrap_or(ViewMode::Raw);
+                let current_file_type = self.state.active_tab()
+                    .map(|t| t.file_type())
+                    .unwrap_or(FileType::Unknown);
+                let zen_mode_active = self.state.is_zen_mode();
+
+                // Track title bar actions
+                let mut title_bar_toggle_auto_save = false;
+                let mut title_bar_toggle_zen = false;
+                let mut title_bar_open_settings = false;
+                let mut title_bar_view_action: Option<ViewSegmentAction> = None;
+
+                // Title bar row - set consistent height and center alignment
+                let title_bar_height = 28.0;
+                ui.set_height(title_bar_height);
+                
+                ui.horizontal_centered(|ui| {
                     ui.add_space(8.0);
 
-                    // App icon/logo placeholder
+                    // App icon/logo placeholder - vertically centered
                     ui.label(egui::RichText::new("📝").size(14.0));
 
                     ui.add_space(8.0);
 
-                    // Window title (dynamically generated)
+                    // Window title (dynamically generated) - use consistent sizing
                     let title = self.window_title();
                     ui.label(egui::RichText::new(title).size(12.0).color(text_color));
+
+                    // Auto-save indicator (after filename) - only show if there's an active editor
+                    if has_editor {
+                        ui.add_space(8.0);
+                        if TitleBarButton::show_auto_save(ui, auto_save_enabled, is_dark).clicked() {
+                            title_bar_toggle_auto_save = true;
+                        }
+                    }
 
                     // Fill remaining space with draggable area
                     let drag_rect = ui.available_rect_before_wrap();
@@ -427,14 +857,101 @@ impl FerriteApp {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                         }
                         min_btn.on_hover_text("Minimize");
+
+                        ui.add_space(8.0);
+
+                        // ═══════════════════════════════════════════════════════════════
+                        // Title Bar Controls (before window buttons, right-to-left)
+                        // Settings → Zen Mode → View Mode Segment
+                        // ═══════════════════════════════════════════════════════════════
+
+                        // Settings button
+                        if TitleBarButton::show(ui, "⚙", "Settings (Ctrl+,)", false, is_dark).clicked() {
+                            title_bar_open_settings = true;
+                        }
+
+                        ui.add_space(4.0);
+
+                        // Zen Mode toggle - use simple "Z" icon for cross-platform compatibility
+                        let zen_icon = if zen_mode_active { "Z" } else { "Z" };
+                        let zen_tooltip = if zen_mode_active {
+                            "Exit Zen Mode (F11)"
+                        } else {
+                            "Enter Zen Mode (F11)"
+                        };
+                        if TitleBarButton::show(ui, zen_icon, zen_tooltip, zen_mode_active, is_dark).clicked() {
+                            title_bar_toggle_zen = true;
+                        }
+
+                        ui.add_space(4.0);
+
+                        // View Mode cycle button (only if there's an active editor with renderable content)
+                        if has_editor && (current_file_type.is_markdown() || current_file_type.is_structured()) {
+                            // Show current mode icon and cycle on click
+                            let (mode_icon, mode_tooltip) = match current_view_mode {
+                                ViewMode::Raw => ("R", "Raw mode - Click to switch to Split (Ctrl+E)"),
+                                ViewMode::Split => ("S", "Split mode - Click to switch to Rendered (Ctrl+E)"),
+                                ViewMode::Rendered => ("V", "Rendered mode - Click to switch to Raw (Ctrl+E)"),
+                            };
+                            
+                            if TitleBarButton::show(ui, mode_icon, mode_tooltip, false, is_dark).clicked() {
+                                // Cycle through modes: Raw -> Split -> Rendered -> Raw
+                                // But only Raw <-> Rendered for non-markdown (structured files)
+                                let next_mode = if current_file_type.is_markdown() {
+                                    match current_view_mode {
+                                        ViewMode::Raw => ViewMode::Split,
+                                        ViewMode::Split => ViewMode::Rendered,
+                                        ViewMode::Rendered => ViewMode::Raw,
+                                    }
+                                } else {
+                                    // Structured files: Raw <-> Rendered only
+                                    match current_view_mode {
+                                        ViewMode::Raw => ViewMode::Rendered,
+                                        _ => ViewMode::Raw,
+                                    }
+                                };
+                                title_bar_view_action = Some(match next_mode {
+                                    ViewMode::Raw => ViewSegmentAction::SetRaw,
+                                    ViewMode::Split => ViewSegmentAction::SetSplit,
+                                    ViewMode::Rendered => ViewSegmentAction::SetRendered,
+                                });
+                            }
+                        }
                     });
                 });
 
                 ui.add_space(2.0);
+
+                // Handle title bar actions (deferred to avoid borrow conflicts)
+                if title_bar_toggle_auto_save {
+                    if let Some(tab) = self.state.active_tab_mut() {
+                        tab.auto_save_enabled = !tab.auto_save_enabled;
+                        debug!("Title bar: Toggle auto-save -> {}", tab.auto_save_enabled);
+                    }
+                }
+                if title_bar_toggle_zen {
+                    self.state.toggle_zen_mode();
+                    debug!("Title bar: Toggle Zen Mode");
+                }
+                if title_bar_open_settings {
+                    self.state.ui.show_settings = true;
+                    debug!("Title bar: Open Settings");
+                }
+                if let Some(view_action) = title_bar_view_action {
+                    if let Some(tab) = self.state.active_tab_mut() {
+                        let new_mode = match view_action {
+                            ViewSegmentAction::SetRaw => ViewMode::Raw,
+                            ViewSegmentAction::SetSplit => ViewMode::Split,
+                            ViewSegmentAction::SetRendered => ViewMode::Rendered,
+                        };
+                        tab.view_mode = new_mode;
+                        debug!("Title bar: Set view mode to {:?}", new_mode);
+                    }
+                }
             });
 
-        // Ribbon panel (below title bar)
-        let ribbon_action = {
+        // Ribbon panel (below title bar) - hidden in Zen Mode
+        let ribbon_action = if !zen_mode {
             // Get state needed for ribbon
             let theme = self.state.settings.theme;
             let view_mode = self
@@ -487,6 +1004,13 @@ impl FerriteApp {
                         .map(|t| t.file_type())
                         .unwrap_or_default();
 
+                    // Get auto-save state for current tab
+                    let auto_save_enabled = self
+                        .state
+                        .active_tab()
+                        .map(|t| t.auto_save_enabled)
+                        .unwrap_or(false);
+
                     action = self.ribbon.show(
                         ui,
                         &theme_colors,
@@ -501,9 +1025,14 @@ impl FerriteApp {
                         self.state.settings.sync_scroll_enabled,
                         self.state.is_workspace_mode(),
                         file_type,
+                        self.state.is_zen_mode(),
+                        auto_save_enabled,
+                        self.state.settings.pipeline_enabled,
                     );
                 });
             action
+        } else {
+            None
         };
 
         // Handle ribbon actions - defer format actions until after editor renders
@@ -519,7 +1048,8 @@ impl FerriteApp {
             None
         };
 
-        // Bottom panel for status bar
+        // Bottom panel for status bar - hidden in Zen Mode
+        if !zen_mode {
         egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 // Left side: File path (clickable for recent files popup)
@@ -682,6 +1212,24 @@ impl FerriteApp {
                         self.state.toggle_about();
                     }
 
+                    // Git branch display (if in a git repository)
+                    if let Some(branch) = self.state.git_service.current_branch() {
+                        ui.separator();
+                        
+                        // Branch icon and name with theme-appropriate color
+                        let branch_color = if is_dark {
+                            egui::Color32::from_rgb(130, 180, 240) // Light blue for dark mode
+                        } else {
+                            egui::Color32::from_rgb(50, 100, 170) // Dark blue for light mode
+                        };
+                        
+                        ui.label(
+                            egui::RichText::new(format!("⎇ {}", branch))
+                                .color(branch_color)
+                                .size(12.0)
+                        ).on_hover_text("Current Git branch");
+                    }
+
                     if let Some(tab) = self.state.active_tab() {
                         ui.separator();
 
@@ -703,16 +1251,17 @@ impl FerriteApp {
                 });
             });
         });
+        } // End of status bar (hidden in Zen Mode)
 
         // ═══════════════════════════════════════════════════════════════════
-        // Outline Panel (if enabled)
+        // Outline Panel (if enabled) - hidden in Zen Mode
         // ═══════════════════════════════════════════════════════════════════
         let mut outline_scroll_to_line: Option<usize> = None;
         let mut outline_toggled_id: Option<String> = None;
         let mut outline_new_width: Option<f32> = None;
         let mut outline_close_requested = false;
 
-        if self.state.settings.outline_enabled {
+        if self.state.settings.outline_enabled && !zen_mode {
             // Update outline if content changed
             self.update_outline_if_needed();
 
@@ -760,7 +1309,7 @@ impl FerriteApp {
         }
 
         // ═══════════════════════════════════════════════════════════════════
-        // File Tree Panel (workspace mode only)
+        // File Tree Panel (workspace mode only) - hidden in Zen Mode
         // ═══════════════════════════════════════════════════════════════════
         let mut file_tree_file_clicked: Option<std::path::PathBuf> = None;
         let mut file_tree_path_toggled: Option<std::path::PathBuf> = None;
@@ -768,7 +1317,14 @@ impl FerriteApp {
         let mut file_tree_new_width: Option<f32> = None;
         let mut file_tree_context_action: Option<FileTreeContextAction> = None;
 
-        if self.state.should_show_file_tree() {
+        if self.state.should_show_file_tree() && !zen_mode {
+            // Get Git statuses first (needs mutable borrow)
+            let git_statuses = if self.state.git_service.is_open() {
+                Some(self.state.git_service.get_all_statuses())
+            } else {
+                None
+            };
+
             if let Some(workspace) = &self.state.workspace {
                 let workspace_name = workspace
                     .root_path
@@ -776,9 +1332,13 @@ impl FerriteApp {
                     .and_then(|n| n.to_str())
                     .unwrap_or("Workspace");
 
-                let output =
-                    self.file_tree_panel
-                        .show(ctx, &workspace.file_tree, workspace_name, is_dark);
+                let output = self.file_tree_panel.show(
+                    ctx,
+                    &workspace.file_tree,
+                    workspace_name,
+                    is_dark,
+                    git_statuses.as_ref(),
+                );
 
                 file_tree_file_clicked = output.file_clicked;
                 file_tree_path_toggled = output.path_toggled;
@@ -830,10 +1390,107 @@ impl FerriteApp {
             self.handle_file_tree_context_action(action);
         }
 
+        // ═══════════════════════════════════════════════════════════════════
+        // Live Pipeline Panel (Bottom panel for JSON/YAML command piping)
+        // ═══════════════════════════════════════════════════════════════════
+        // Only show if:
+        // 1. Pipeline feature is enabled globally
+        // 2. Not in Zen Mode (hide for distraction-free writing)
+        // 3. Active tab is JSON/YAML and has pipeline panel visible
+        let show_pipeline = self.state.settings.pipeline_enabled
+            && !zen_mode
+            && self.state.active_tab().map(|t| t.supports_pipeline() && t.pipeline_visible()).unwrap_or(false);
+
+        if show_pipeline {
+            let panel_height = self.pipeline_panel.height();
+            egui::TopBottomPanel::bottom("pipeline_panel")
+                .resizable(false) // We handle resize ourselves
+                .exact_height(panel_height)
+                .show(ctx, |ui| {
+                    // Custom resize handle at the top of the panel
+                    let resize_response = ui.allocate_response(
+                        egui::vec2(ui.available_width(), 6.0),
+                        egui::Sense::drag(),
+                    );
+                    
+                    // Draw resize handle (thin line)
+                    let handle_rect = resize_response.rect;
+                    let handle_color = if resize_response.hovered() || resize_response.dragged() {
+                        if is_dark {
+                            egui::Color32::from_rgb(100, 100, 120)
+                        } else {
+                            egui::Color32::from_rgb(160, 160, 180)
+                        }
+                    } else {
+                        if is_dark {
+                            egui::Color32::from_rgb(60, 60, 70)
+                        } else {
+                            egui::Color32::from_rgb(200, 200, 210)
+                        }
+                    };
+                    ui.painter().rect_filled(
+                        egui::Rect::from_center_size(handle_rect.center(), egui::vec2(60.0, 3.0)),
+                        2.0,
+                        handle_color,
+                    );
+                    
+                    // Change cursor on hover
+                    if resize_response.hovered() || resize_response.dragged() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                    }
+                    
+                    // Handle drag to resize (dragging up = increase height, dragging down = decrease)
+                    if resize_response.dragged() {
+                        let delta = -resize_response.drag_delta().y; // Negative because up = bigger
+                        let new_height = (panel_height + delta).clamp(100.0, 500.0);
+                        if (new_height - panel_height).abs() > 0.5 {
+                            self.pipeline_panel.set_height(new_height);
+                            self.state.settings.pipeline_panel_height = new_height;
+                            self.state.mark_settings_dirty();
+                        }
+                    }
+
+                    // Get working directory from tab's file path or workspace
+                    let working_dir = self.state.active_tab()
+                        .and_then(|t| t.path.as_ref())
+                        .and_then(|p| p.parent())
+                        .map(|p| p.to_path_buf())
+                        .or_else(|| self.state.workspace.as_ref().map(|w| w.root_path.clone()));
+
+                    // Get content and tab state
+                    let content = self.state.active_tab().map(|t| t.content.clone()).unwrap_or_default();
+
+                    if let Some(tab) = self.state.active_tab_mut() {
+                        let output = self.pipeline_panel.show(
+                            ui,
+                            &mut tab.pipeline_state,
+                            &content,
+                            working_dir,
+                            is_dark,
+                        );
+
+                        // Handle panel close
+                        if output.closed {
+                            // Tab's pipeline_visible is already set to false by the panel
+                        }
+                    }
+
+                    // Save recent commands if they changed
+                    let recent_cmds = self.pipeline_panel.get_recent_commands_vec();
+                    if recent_cmds != self.state.settings.pipeline_recent_commands {
+                        self.state.settings.pipeline_recent_commands = recent_cmds;
+                        self.state.mark_settings_dirty();
+                    }
+                });
+        }
+
         // Central panel for editor content
         egui::CentralPanel::default().show(ctx, |ui| {
             // Tab bar - uses custom wrapping layout for multi-line support
+            // Hidden in Zen Mode for distraction-free editing
             let mut tab_to_close: Option<usize> = None;
+            
+            if !zen_mode {
 
             // Collect tab info first to avoid borrow issues
             let tab_count = self.state.tab_count();
@@ -851,21 +1508,32 @@ impl FerriteApp {
             let tab_height = 24.0;
             let tab_spacing = 4.0;
             let close_btn_width = 18.0;
+            let tab_padding = 16.0; // horizontal padding inside tab
+            let min_text_width = 60.0;
 
-            // Calculate tab widths and layout
+            // Pre-calculate tab widths using actual text measurement
+            // This ensures consistent sizing between layout and render passes
+            let tab_widths: Vec<f32> = tab_titles
+                .iter()
+                .map(|(_, title, _)| {
+                    let text_galley = ui.fonts(|f| {
+                        f.layout_no_wrap(
+                            title.clone(),
+                            egui::FontId::default(),
+                            egui::Color32::WHITE, // color doesn't affect measurement
+                        )
+                    });
+                    let text_width = text_galley.size().x.max(min_text_width);
+                    text_width + close_btn_width + tab_padding
+                })
+                .collect();
+
+            // Calculate tab positions for layout
             let mut current_x = 0.0;
             let mut current_row = 0;
             let mut tab_positions: Vec<(f32, usize)> = Vec::new(); // (x position, row)
 
-            for (_, title, _) in &tab_titles {
-                // Estimate tab width: title + close button + padding
-                let text_width = ui
-                    .fonts(|f| {
-                        f.glyph_width(&egui::FontId::default(), 'M') * title.len() as f32 * 0.6
-                    })
-                    .max(60.0);
-                let tab_width = text_width + close_btn_width + 16.0; // padding
-
+            for tab_width in &tab_widths {
                 // Check if we need to wrap to next row
                 if current_x + tab_width > available_width && current_x > 0.0 {
                     current_x = 0.0;
@@ -900,16 +1568,11 @@ impl FerriteApp {
             };
             let text_color = ui.visuals().text_color();
 
-            for (idx, ((tab_idx, title, selected), (x_pos, row))) in
-                tab_titles.iter().zip(tab_positions.iter()).enumerate()
+            for (idx, (((tab_idx, title, selected), (x_pos, row)), tab_width)) in
+                tab_titles.iter().zip(tab_positions.iter()).zip(tab_widths.iter()).enumerate()
             {
-                // Calculate tab dimensions
-                let text_width = ui
-                    .fonts(|f| {
-                        f.glyph_width(&egui::FontId::default(), 'M') * title.len() as f32 * 0.6
-                    })
-                    .max(60.0);
-                let tab_width = text_width + close_btn_width + 16.0;
+                // Use pre-calculated tab width for consistency
+                let tab_width = *tab_width;
 
                 let tab_rect = egui::Rect::from_min_size(
                     tab_bar_rect.min + egui::vec2(*x_pos, *row as f32 * (tab_height + 2.0)),
@@ -930,10 +1593,11 @@ impl FerriteApp {
                     ui.painter().rect_filled(tab_rect, 4.0, hover_bg);
                 }
 
-                // Draw tab title
+                // Draw tab title - use available width minus close button and padding
+                let title_available_width = tab_width - close_btn_width - tab_padding;
                 let title_rect = egui::Rect::from_min_size(
                     tab_rect.min + egui::vec2(8.0, 4.0),
-                    egui::vec2(text_width, tab_height - 8.0),
+                    egui::vec2(title_available_width, tab_height - 8.0),
                 );
                 ui.painter().text(
                     title_rect.left_center(),
@@ -984,19 +1648,12 @@ impl FerriteApp {
                 }
             }
 
-            // Draw + button
-            let plus_x = if tab_positions.is_empty() {
+            // Draw + button - use pre-calculated tab widths for consistency
+            let plus_x = if tab_positions.is_empty() || tab_widths.is_empty() {
                 0.0
             } else {
                 let last_pos = tab_positions.last().unwrap();
-                let last_title = &tab_titles.last().unwrap().1;
-                let last_width = ui
-                    .fonts(|f| {
-                        f.glyph_width(&egui::FontId::default(), 'M') * last_title.len() as f32 * 0.6
-                    })
-                    .max(60.0)
-                    + close_btn_width
-                    + 16.0;
+                let last_width = *tab_widths.last().unwrap();
 
                 if last_pos.0 + last_width + tab_spacing + plus_btn_width > available_width {
                     0.0 // Wrap to next row
@@ -1043,7 +1700,24 @@ impl FerriteApp {
                 self.state.close_tab(index);
             }
 
-            ui.separator();
+            // Draw a visible separator line between tabs and editor
+            // Uses stronger contrast than default egui separator for accessibility
+            ui.add_space(2.0);
+            {
+                let separator_color = if is_dark {
+                    egui::Color32::from_rgb(60, 60, 60)
+                } else {
+                    egui::Color32::from_rgb(160, 160, 160) // ~3.2:1 contrast on white
+                };
+                let rect = ui.available_rect_before_wrap();
+                let y = rect.min.y;
+                ui.painter().line_segment(
+                    [egui::pos2(rect.min.x, y), egui::pos2(rect.max.x, y)],
+                    egui::Stroke::new(1.0, separator_color),
+                );
+            }
+            ui.add_space(3.0);
+            } // End of tab bar (hidden in Zen Mode)
 
             // Editor widget - extract settings values to avoid borrow conflicts
             let font_size = self.state.settings.font_size;
@@ -1080,33 +1754,530 @@ impl FerriteApp {
                     t.id,
                     t.view_mode,
                     t.path.as_ref().and_then(|p| get_structured_file_type(p)),
+                    t.transient_highlight_range(),
                 )
             });
 
-            if let Some((tab_id, view_mode, structured_type)) = tab_info {
+            if let Some((tab_id, view_mode, structured_type, transient_hl)) = tab_info {
                 match view_mode {
                     ViewMode::Raw => {
-                        // Raw mode: use the plain EditorWidget
+                        // Raw mode: use the plain EditorWidget with optional minimap
+                        let zen_max_column_width = self.state.settings.zen_max_column_width;
+
+                        // Capture scroll offset before mutable borrow for scroll detection
+                        let prev_scroll_offset = self.state.active_tab().map(|t| t.scroll_offset).unwrap_or(0.0);
+
+                        // Get folding settings (before mutable borrow)
+                        let folding_enabled = self.state.settings.folding_enabled;
+                        let show_fold_indicators = self.state.settings.folding_show_indicators && folding_enabled;
+                        let fold_headings = self.state.settings.fold_headings;
+                        let fold_code_blocks = self.state.settings.fold_code_blocks;
+                        let fold_lists = self.state.settings.fold_lists;
+                        let fold_indentation = self.state.settings.fold_indentation;
+
+                        // Get bracket matching setting
+                        let highlight_matching_pairs = self.state.settings.highlight_matching_pairs;
+
+                        // Get syntax highlighting setting
+                        let syntax_highlighting_enabled = self.state.settings.syntax_highlighting_enabled;
+
+                        // Get minimap settings (hidden in Zen Mode)
+                        let minimap_enabled = self.state.settings.minimap_enabled && !zen_mode;
+                        let minimap_width = self.state.settings.minimap_width;
+
+                        // Get tab data needed for minimap before mutable borrow
+                        let minimap_data = if minimap_enabled {
+                            self.state.active_tab().map(|t| {
+                                (
+                                    t.content.clone(),
+                                    t.scroll_offset,
+                                    t.viewport_height,
+                                    t.content_height,
+                                    t.raw_line_height,
+                                )
+                            })
+                        } else {
+                            None
+                        };
+
+                        // Get search matches for minimap visualization
+                        let minimap_search_matches: Vec<(usize, usize)> = if minimap_enabled {
+                            self.state.ui.find_state.matches.clone()
+                        } else {
+                            Vec::new()
+                        };
+                        let minimap_current_match = self.state.ui.find_state.current_match;
+
+                        // Track minimap scroll request
+                        let mut minimap_scroll_to: Option<f32> = None;
+
+                        // Clone tab path before mutable borrow for syntax highlighting
+                        let tab_path_for_syntax = self.state.active_tab().and_then(|t| t.path.clone());
+
                         if let Some(tab) = self.state.active_tab_mut() {
+                            // Update folds if dirty
+                            if folding_enabled && tab.folds_dirty() {
+                                tab.update_folds(
+                                    fold_headings,
+                                    fold_code_blocks,
+                                    fold_lists,
+                                    fold_indentation,
+                                );
+                            }
+
+                            // Calculate layout for editor and minimap
+                            let total_rect = ui.available_rect_before_wrap();
+                            let editor_width = if minimap_enabled {
+                                total_rect.width() - minimap_width
+                            } else {
+                                total_rect.width()
+                            };
+
+                            let editor_rect = egui::Rect::from_min_size(
+                                total_rect.min,
+                                egui::vec2(editor_width, total_rect.height()),
+                            );
+                            let minimap_rect = if minimap_enabled {
+                                Some(egui::Rect::from_min_size(
+                                    egui::pos2(total_rect.min.x + editor_width, total_rect.min.y),
+                                    egui::vec2(minimap_width, total_rect.height()),
+                                ))
+                            } else {
+                                None
+                            };
+
+                            // Allocate the total area
+                            ui.allocate_rect(total_rect, egui::Sense::hover());
+
+                            // Show editor in its region
+                            let mut editor_ui = ui.child_ui(editor_rect, egui::Layout::top_down(egui::Align::LEFT), None);
+
                             let mut editor = EditorWidget::new(tab)
                                 .font_size(font_size)
                                 .font_family(font_family)
                                 .word_wrap(word_wrap)
-                                .show_line_numbers(show_line_numbers)
+                                .show_line_numbers(show_line_numbers && !zen_mode) // Hide line numbers in Zen Mode
+                                .show_fold_indicators(show_fold_indicators && !zen_mode) // Hide in Zen Mode
                                 .theme_colors(theme_colors.clone())
                                 .id(egui::Id::new("main_editor_raw"))
-                                .scroll_to_line(scroll_to_line);
+                                .scroll_to_line(scroll_to_line)
+                                .zen_mode(zen_mode, zen_max_column_width)
+                                .transient_highlight(transient_hl)
+                                .highlight_matching_pairs(highlight_matching_pairs)
+                                .syntax_highlighting(syntax_highlighting_enabled, tab_path_for_syntax.clone(), is_dark);
 
                             // Add search highlights if available
                             if let Some(highlights) = search_highlights.clone() {
                                 editor = editor.search_highlights(highlights);
                             }
 
-                            let editor_output = editor.show(ui);
+                            let editor_output = editor.show(&mut editor_ui);
+
+                            // Handle fold toggle click
+                            if let Some(fold_line) = editor_output.fold_toggle_line {
+                                tab.toggle_fold_at_line(fold_line);
+                            }
+
+                            // Handle transient highlight expiry
+                            if tab.has_transient_highlight() {
+                                // Clear on edit
+                                if editor_output.changed {
+                                    tab.on_edit_event();
+                                    debug!("Cleared transient highlight due to edit");
+                                }
+                                // Clear on scroll (after the initial programmatic scroll)
+                                else if (tab.scroll_offset - prev_scroll_offset).abs() > 1.0 {
+                                    tab.on_scroll_event();
+                                    // Note: on_scroll_event handles the guard for initial scroll
+                                }
+                                // Clear on any mouse click in the editor
+                                else if ui.input(|i| i.pointer.any_click()) {
+                                    tab.on_click_event();
+                                    debug!("Cleared transient highlight due to click");
+                                }
+                            }
 
                             if editor_output.changed {
                                 debug!("Content modified in raw editor");
+                                // Mark folds as dirty when content changes
+                                if folding_enabled {
+                                    tab.mark_folds_dirty();
+                                }
                             }
+
+                            // Handle Ctrl+Click to add cursor
+                            if let Some(click_pos) = editor_output.ctrl_click_pos {
+                                tab.add_cursor(click_pos);
+                                debug!(
+                                    "Ctrl+Click: added cursor at position {}, now {} cursor(s)",
+                                    click_pos,
+                                    tab.cursor_count()
+                                );
+                            }
+
+                            // Show minimap if enabled
+                            if let (Some(minimap_rect), Some((content, scroll_offset, viewport_height, content_height, line_height))) = (minimap_rect, minimap_data) {
+                                let mut minimap_ui = ui.child_ui(minimap_rect, egui::Layout::top_down(egui::Align::LEFT), None);
+
+                                let mut minimap = Minimap::new(&content)
+                                    .width(minimap_width)
+                                    .scroll_offset(scroll_offset)
+                                    .viewport_height(viewport_height)
+                                    .content_height(content_height)
+                                    .line_height(line_height)
+                                    .theme_colors(theme_colors.clone());
+
+                                // Add search highlights to minimap
+                                if !minimap_search_matches.is_empty() {
+                                    minimap = minimap
+                                        .search_highlights(&minimap_search_matches)
+                                        .current_match(minimap_current_match);
+                                }
+
+                                let minimap_output = minimap.show(&mut minimap_ui);
+
+                                // Handle minimap navigation
+                                if let Some(target_offset) = minimap_output.scroll_to_offset {
+                                    minimap_scroll_to = Some(target_offset);
+                                }
+                            }
+                        }
+
+                        // Apply minimap scroll request (after mutable borrow ends)
+                        if let Some(scroll_offset) = minimap_scroll_to {
+                            if let Some(tab) = self.state.active_tab_mut() {
+                                tab.pending_scroll_offset = Some(scroll_offset);
+                                ui.ctx().request_repaint();
+                            }
+                        }
+                    }
+                    ViewMode::Split => {
+                        // Split view: raw editor on left, rendered preview on right
+                        // Not available for structured files or Zen Mode
+                        
+                        // In Zen Mode: show only the raw editor (full-width, distraction-free)
+                        // The Split mode is preserved so it returns when exiting Zen Mode
+                        if zen_mode {
+                            let zen_max_column_width = self.state.settings.zen_max_column_width;
+                            let prev_scroll_offset = self.state.active_tab().map(|t| t.scroll_offset).unwrap_or(0.0);
+                            let folding_enabled = self.state.settings.folding_enabled;
+                            // Fold indicators are hidden in Zen Mode
+                            let fold_headings = self.state.settings.fold_headings;
+                            let fold_code_blocks = self.state.settings.fold_code_blocks;
+                            let fold_lists = self.state.settings.fold_lists;
+                            let fold_indentation = self.state.settings.fold_indentation;
+                            let highlight_matching_pairs = self.state.settings.highlight_matching_pairs;
+                            let syntax_highlighting_enabled = self.state.settings.syntax_highlighting_enabled;
+
+                            // Clone tab path before mutable borrow for syntax highlighting
+                            let tab_path_for_syntax = self.state.active_tab().and_then(|t| t.path.clone());
+
+                            if let Some(tab) = self.state.active_tab_mut() {
+                                if folding_enabled && tab.folds_dirty() {
+                                    tab.update_folds(fold_headings, fold_code_blocks, fold_lists, fold_indentation);
+                                }
+
+                                let mut editor = EditorWidget::new(tab)
+                                    .font_size(font_size)
+                                    .font_family(font_family)
+                                    .word_wrap(word_wrap)
+                                    .show_line_numbers(false) // Hide in Zen Mode
+                                    .show_fold_indicators(false) // Hide in Zen Mode
+                                    .theme_colors(theme_colors.clone())
+                                    .id(egui::Id::new("split_zen_raw"))
+                                    .scroll_to_line(scroll_to_line)
+                                    .zen_mode(true, zen_max_column_width)
+                                    .transient_highlight(transient_hl)
+                                    .highlight_matching_pairs(highlight_matching_pairs)
+                                    .syntax_highlighting(syntax_highlighting_enabled, tab_path_for_syntax.clone(), is_dark);
+
+                                if let Some(highlights) = search_highlights.clone() {
+                                    editor = editor.search_highlights(highlights);
+                                }
+
+                                let editor_output = editor.show(ui);
+
+                                if let Some(fold_line) = editor_output.fold_toggle_line {
+                                    tab.toggle_fold_at_line(fold_line);
+                                }
+
+                                if tab.has_transient_highlight() {
+                                    if editor_output.changed {
+                                        tab.on_edit_event();
+                                    } else if (tab.scroll_offset - prev_scroll_offset).abs() > 1.0 {
+                                        tab.on_scroll_event();
+                                    } else if ui.input(|i| i.pointer.any_click()) {
+                                        tab.on_click_event();
+                                    }
+                                }
+
+                                if editor_output.changed && folding_enabled {
+                                    tab.mark_folds_dirty();
+                                }
+                            }
+                        } else if structured_type.is_some() {
+                            // Structured files don't support split view, switch to Raw mode
+                            if let Some(tab) = self.state.active_tab_mut() {
+                                tab.view_mode = ViewMode::Raw;
+                            }
+                        } else {
+                            // Get split ratio before mutable borrow
+                            let split_ratio = self.state.active_tab().map(|t| t.split_ratio).unwrap_or(0.5);
+                            let available_width = ui.available_width();
+                            let _available_height = ui.available_height(); // For reference (using rect-based layout)
+                            let splitter_width = 8.0; // Width of the draggable splitter area
+
+                            // Get minimap settings
+                            let minimap_enabled = self.state.settings.minimap_enabled;
+                            let minimap_width = self.state.settings.minimap_width;
+                            let effective_minimap_width = if minimap_enabled { minimap_width } else { 0.0 };
+
+                            // Calculate widths: left pane gets split_ratio of (total - splitter - minimap)
+                            let content_width = available_width - splitter_width - effective_minimap_width;
+                            let left_width = content_width * split_ratio;
+                            let right_width = content_width * (1.0 - split_ratio);
+
+                            // Get folding settings
+                            let folding_enabled = self.state.settings.folding_enabled;
+                            let show_fold_indicators = self.state.settings.folding_show_indicators && folding_enabled;
+                            let fold_headings = self.state.settings.fold_headings;
+                            let fold_code_blocks = self.state.settings.fold_code_blocks;
+                            let fold_lists = self.state.settings.fold_lists;
+                            let fold_indentation = self.state.settings.fold_indentation;
+
+                            // Get bracket matching setting
+                            let highlight_matching_pairs = self.state.settings.highlight_matching_pairs;
+
+                            // Get syntax highlighting setting
+                            let syntax_highlighting_enabled = self.state.settings.syntax_highlighting_enabled;
+
+                            // Get content for preview (read-only clone) and path for syntax highlighting
+                            let preview_content = self.state.active_tab().map(|t| t.content.clone()).unwrap_or_default();
+                            let tab_path_for_syntax = self.state.active_tab().and_then(|t| t.path.clone());
+
+                            // Get tab data for minimap before mutable borrow
+                            let minimap_data = if minimap_enabled {
+                                self.state.active_tab().map(|t| {
+                                    (
+                                        t.content.clone(),
+                                        t.scroll_offset,
+                                        t.viewport_height,
+                                        t.content_height,
+                                        t.raw_line_height,
+                                    )
+                                })
+                            } else {
+                                None
+                            };
+
+                            // Get search matches for minimap
+                            let minimap_search_matches: Vec<(usize, usize)> = if minimap_enabled {
+                                self.state.ui.find_state.matches.clone()
+                            } else {
+                                Vec::new()
+                            };
+                            let minimap_current_match = self.state.ui.find_state.current_match;
+
+                            // Track minimap scroll request
+                            let mut minimap_scroll_to: Option<f32> = None;
+
+                            // Calculate explicit rectangles for split view layout
+                            // Layout: [Editor] [Minimap] [Splitter] [Preview]
+                            let total_rect = ui.available_rect_before_wrap();
+                            let left_rect = egui::Rect::from_min_size(
+                                total_rect.min,
+                                egui::vec2(left_width, total_rect.height()),
+                            );
+                            let minimap_rect = if minimap_enabled {
+                                Some(egui::Rect::from_min_size(
+                                    egui::pos2(total_rect.min.x + left_width, total_rect.min.y),
+                                    egui::vec2(minimap_width, total_rect.height()),
+                                ))
+                            } else {
+                                None
+                            };
+                            let splitter_rect = egui::Rect::from_min_size(
+                                egui::pos2(total_rect.min.x + left_width + effective_minimap_width, total_rect.min.y),
+                                egui::vec2(splitter_width, total_rect.height()),
+                            );
+                            let right_rect = egui::Rect::from_min_size(
+                                egui::pos2(total_rect.min.x + left_width + effective_minimap_width + splitter_width, total_rect.min.y),
+                                egui::vec2(right_width, total_rect.height()),
+                            );
+
+                            // Allocate the entire area so egui knows we're using it
+                            ui.allocate_rect(total_rect, egui::Sense::hover());
+
+                            // ═══════════════════════════════════════════════════════════════
+                            // Left pane: Raw editor
+                            // ═══════════════════════════════════════════════════════════════
+                            let mut left_ui = ui.child_ui(left_rect, egui::Layout::top_down(egui::Align::LEFT), None);
+                            if let Some(tab) = self.state.active_tab_mut() {
+                                // Update folds if dirty
+                                if folding_enabled && tab.folds_dirty() {
+                                    tab.update_folds(
+                                        fold_headings,
+                                        fold_code_blocks,
+                                        fold_lists,
+                                        fold_indentation,
+                                    );
+                                }
+
+                                let mut editor = EditorWidget::new(tab)
+                                    .font_size(font_size)
+                                    .font_family(font_family)
+                                    .word_wrap(word_wrap)
+                                    .show_line_numbers(show_line_numbers)
+                                    .show_fold_indicators(show_fold_indicators)
+                                    .theme_colors(theme_colors.clone())
+                                    .id(egui::Id::new("split_editor_raw"))
+                                    .scroll_to_line(scroll_to_line)
+                                    .transient_highlight(transient_hl)
+                                    .highlight_matching_pairs(highlight_matching_pairs)
+                                    .syntax_highlighting(syntax_highlighting_enabled, tab_path_for_syntax.clone(), is_dark);
+
+                                // Add search highlights if available
+                                if let Some(highlights) = search_highlights.clone() {
+                                    editor = editor.search_highlights(highlights);
+                                }
+
+                                let editor_output = editor.show(&mut left_ui);
+
+                                // Handle fold toggle click
+                                if let Some(fold_line) = editor_output.fold_toggle_line {
+                                    tab.toggle_fold_at_line(fold_line);
+                                }
+
+                                // Handle transient highlight expiry
+                                if tab.has_transient_highlight() {
+                                    if editor_output.changed {
+                                        tab.on_edit_event();
+                                    } else if left_ui.input(|i| i.pointer.any_click()) {
+                                        tab.on_click_event();
+                                    }
+                                }
+
+                                if editor_output.changed {
+                                    if folding_enabled {
+                                        tab.mark_folds_dirty();
+                                    }
+                                }
+                            }
+
+                            // ═══════════════════════════════════════════════════════════════
+                            // Minimap (between editor and splitter)
+                            // ═══════════════════════════════════════════════════════════════
+                            if let (Some(mm_rect), Some((content, scroll_offset, viewport_height, content_height, line_height))) = (minimap_rect, minimap_data) {
+                                let mut minimap_ui = ui.child_ui(mm_rect, egui::Layout::top_down(egui::Align::LEFT), None);
+
+                                let mut minimap = Minimap::new(&content)
+                                    .width(minimap_width)
+                                    .scroll_offset(scroll_offset)
+                                    .viewport_height(viewport_height)
+                                    .content_height(content_height)
+                                    .line_height(line_height)
+                                    .theme_colors(theme_colors.clone());
+
+                                // Add search highlights to minimap
+                                if !minimap_search_matches.is_empty() {
+                                    minimap = minimap
+                                        .search_highlights(&minimap_search_matches)
+                                        .current_match(minimap_current_match);
+                                }
+
+                                let minimap_output = minimap.show(&mut minimap_ui);
+
+                                // Handle minimap navigation
+                                if let Some(target_offset) = minimap_output.scroll_to_offset {
+                                    minimap_scroll_to = Some(target_offset);
+                                }
+                            }
+
+                            // Apply minimap scroll request
+                            if let Some(scroll_offset) = minimap_scroll_to {
+                                if let Some(tab) = self.state.active_tab_mut() {
+                                    tab.pending_scroll_offset = Some(scroll_offset);
+                                    ui.ctx().request_repaint();
+                                }
+                            }
+
+                            // ═══════════════════════════════════════════════════════════════
+                            // Splitter (draggable)
+                            // ═══════════════════════════════════════════════════════════════
+                            let splitter_response = ui.interact(splitter_rect, egui::Id::new("split_splitter"), egui::Sense::click_and_drag());
+
+                            // Draw splitter visual
+                            let is_dark = ui.visuals().dark_mode;
+                            let splitter_color = if splitter_response.hovered() || splitter_response.dragged() {
+                                if is_dark {
+                                    egui::Color32::from_rgb(100, 100, 120)
+                                } else {
+                                    egui::Color32::from_rgb(140, 140, 160)
+                                }
+                            } else if is_dark {
+                                egui::Color32::from_rgb(60, 60, 70)
+                            } else {
+                                egui::Color32::from_rgb(180, 180, 190)
+                            };
+
+                            ui.painter().rect_filled(splitter_rect, 0.0, splitter_color);
+
+                            // Draw grip lines in the center
+                            let grip_color = if is_dark {
+                                egui::Color32::from_rgb(120, 120, 140)
+                            } else {
+                                egui::Color32::from_rgb(100, 100, 120)
+                            };
+                            let center_x = splitter_rect.center().x;
+                            let center_y = splitter_rect.center().y;
+                            for i in -2..=2 {
+                                let y = center_y + i as f32 * 6.0;
+                                ui.painter().line_segment(
+                                    [egui::pos2(center_x - 2.0, y), egui::pos2(center_x + 2.0, y)],
+                                    egui::Stroke::new(1.0, grip_color),
+                                );
+                            }
+
+                            // Handle drag to resize
+                            // Calculate ratio based on content_width (excluding minimap and splitter)
+                            if splitter_response.dragged() {
+                                if let Some(pointer_pos) = ui.ctx().pointer_interact_pos() {
+                                    // The draggable area is content_width, and minimap is between editor and splitter
+                                    // So we need to calculate ratio of (pointer - left - minimap) / content_width
+                                    let drag_pos = pointer_pos.x - total_rect.left();
+                                    // If minimap is enabled, the left pane ends at the minimap
+                                    // The ratio should be based on how much of content_width is on the left
+                                    let new_ratio = (drag_pos / (content_width + effective_minimap_width + splitter_width))
+                                        .clamp(0.15, 0.85);
+                                    if let Some(tab) = self.state.active_tab_mut() {
+                                        tab.set_split_ratio(new_ratio);
+                                    }
+                                }
+                            }
+
+                            // Set resize cursor
+                            if splitter_response.hovered() || splitter_response.dragged() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                            }
+
+                            // ═══════════════════════════════════════════════════════════════
+                            // Right pane: Rendered preview (interactive for buttons)
+                            // ═══════════════════════════════════════════════════════════════
+                            let mut right_ui = ui.child_ui(right_rect, egui::Layout::top_down(egui::Align::LEFT), None);
+                            
+                            // Render preview - scrolls independently from raw editor
+                            // Preview is interactive so Edit/Copy buttons on code blocks work
+                            // Note: Preview uses a clone of content, so any text edits won't persist
+                            // TODO: Implement scroll sync in v0.3.0
+                            let mut preview_content_clone = preview_content.clone();
+                            let _preview_output = MarkdownEditor::new(&mut preview_content_clone)
+                                .mode(EditorMode::Rendered)
+                                .font_size(font_size)
+                                .font_family(font_family)
+                                .word_wrap(word_wrap)
+                                .theme(theme)
+                                .id(egui::Id::new("split_preview_rendered"))
+                                .show(&mut right_ui);
                         }
                     }
                     ViewMode::Rendered => {
@@ -1118,13 +2289,20 @@ impl FerriteApp {
                             let tree_state = self.tree_viewer_states.entry(tab_id).or_default();
 
                             if let Some(tab) = self.state.active_tab_mut() {
+                                // Capture content before editing for undo support
+                                let content_before = tab.content.clone();
+
                                 let output =
                                     TreeViewer::new(&mut tab.content, file_type, tree_state)
                                         .font_size(font_size)
                                         .show(ui);
 
                                 if output.changed {
-                                    debug!("Content modified in tree viewer");
+                                    // Record edit for undo/redo support
+                                    tab.record_edit(content_before);
+                                    // Mark content as edited for auto-save scheduling
+                                    tab.mark_content_edited();
+                                    debug!("Content modified in tree viewer, recorded for undo");
                                 }
 
                                 // Update scroll offset for sync scrolling
@@ -1133,6 +2311,13 @@ impl FerriteApp {
                         } else {
                             // Markdown file: use the WYSIWYG MarkdownEditor
                             if let Some(tab) = self.state.active_tab_mut() {
+                                // Capture content before editing for undo support
+                                let content_before = tab.content.clone();
+                                
+                                // Handle scroll sync: check for pending scroll ratio or offset
+                                let pending_offset = tab.pending_scroll_offset.take();
+                                let pending_ratio = tab.pending_scroll_ratio.take();
+
                                 let editor_output = MarkdownEditor::new(&mut tab.content)
                                     .mode(EditorMode::Rendered)
                                     .font_size(font_size)
@@ -1141,24 +2326,72 @@ impl FerriteApp {
                                     .theme(theme)
                                     .id(egui::Id::new("main_editor_rendered"))
                                     .scroll_to_line(scroll_to_line)
+                                    .pending_scroll_offset(pending_offset)
                                     .show(ui);
 
                                 if editor_output.changed {
-                                    // Content is already modified through the mutable reference
-                                    debug!("Content modified in rendered editor");
+                                    // Record edit for undo/redo support
+                                    tab.record_edit(content_before);
+                                    // Mark content as edited for auto-save scheduling
+                                    tab.mark_content_edited();
+                                    debug!("Content modified in rendered editor, recorded for undo");
                                 }
 
                                 // Update cursor position from rendered editor
                                 tab.cursor_position = editor_output.cursor_position;
 
-                                // Update scroll offset for sync scrolling
-                                let old_scroll = tab.scroll_offset;
+                                // Update scroll metrics for sync scrolling
                                 tab.scroll_offset = editor_output.scroll_offset;
-                                if (old_scroll - editor_output.scroll_offset).abs() > 1.0 {
-                                    debug!(
-                                        "MarkdownEditor scroll: {} → {}",
-                                        old_scroll, editor_output.scroll_offset
-                                    );
+                                tab.content_height = editor_output.content_height;
+                                tab.viewport_height = editor_output.viewport_height;
+                                
+                                // Store line mappings for scroll sync (source_line → rendered_y)
+                                tab.rendered_line_mappings = editor_output.line_mappings
+                                    .iter()
+                                    .map(|m| (m.start_line, m.end_line, m.rendered_y))
+                                    .collect();
+                                
+                                // Handle pending scroll to line: convert to offset using FRESH line mappings
+                                // This provides accurate content-based sync using interpolation
+                                if let Some(target_line) = tab.pending_scroll_to_line.take() {
+                                    if let Some(rendered_y) = Self::find_rendered_y_for_line_interpolated(
+                                        &tab.rendered_line_mappings,
+                                        target_line,
+                                        editor_output.content_height,
+                                    ) {
+                                        tab.pending_scroll_offset = Some(rendered_y);
+                                        debug!(
+                                            "Converted line {} to rendered offset {:.1} (interpolated, {} mappings)",
+                                            target_line, rendered_y, tab.rendered_line_mappings.len()
+                                        );
+                                        ui.ctx().request_repaint();
+                                    } else {
+                                        debug!(
+                                            "No mapping for line {} ({} mappings), falling back to ratio",
+                                            target_line, tab.rendered_line_mappings.len()
+                                        );
+                                        // Fallback: estimate based on line ratio
+                                        let total_lines = tab.content.lines().count().max(1);
+                                        let line_ratio = (target_line as f32 / total_lines as f32).clamp(0.0, 1.0);
+                                        let max_scroll = (editor_output.content_height - editor_output.viewport_height).max(0.0);
+                                        tab.pending_scroll_offset = Some(line_ratio * max_scroll);
+                                        ui.ctx().request_repaint();
+                                    }
+                                }
+                                
+                                // Handle pending scroll ratio: convert to offset now that we have content_height
+                                if let Some(ratio) = pending_ratio {
+                                    let max_scroll = (editor_output.content_height - editor_output.viewport_height).max(0.0);
+                                    if max_scroll > 0.0 {
+                                        let target_offset = ratio * max_scroll;
+                                        tab.pending_scroll_offset = Some(target_offset);
+                                        debug!(
+                                            "Converted scroll ratio {:.3} to offset {:.1} (content_height={}, viewport_height={})",
+                                            ratio, target_offset, editor_output.content_height, editor_output.viewport_height
+                                        );
+                                        // Request repaint to apply the offset on next frame
+                                        ui.ctx().request_repaint();
+                                    }
                                 }
 
                                 // Update selection from focused element (for rendered mode formatting)
@@ -1275,26 +2508,8 @@ impl FerriteApp {
                 }
 
                 // Handle navigation to file
-                if let Some((file_path, line_number)) = output.navigate_to {
-                    match self.state.open_file(file_path.clone()) {
-                        Ok(_) => {
-                            debug!(
-                                "Opened file from search: {} at line {}",
-                                file_path.display(),
-                                line_number
-                            );
-                            // TODO(enhancement): Navigate to line_number in the editor
-                            // This would scroll the editor to the specific line from search results
-                            if let Some(workspace) = self.state.workspace_mut() {
-                                workspace.add_recent_file(file_path);
-                            }
-                        }
-                        Err(e) => {
-                            warn!("Failed to open file: {}", e);
-                            self.state
-                                .show_error(format!("Failed to open file:\n{}", e));
-                        }
-                    }
+                if let Some(target) = output.navigate_to {
+                    self.handle_search_navigation(target);
                 }
             }
         }
@@ -1332,8 +2547,10 @@ impl FerriteApp {
         for path in paths {
             info!("Opening file: {}", path.display());
             match self.state.open_file(path.clone()) {
-                Ok(_) => {
+                Ok(tab_index) => {
                     success_count += 1;
+                    // Check for auto-save recovery
+                    self.check_auto_save_recovery(tab_index);
                 }
                 Err(e) => {
                     warn!("Failed to open file {}: {}", path.display(), e);
@@ -1376,12 +2593,20 @@ impl FerriteApp {
                 .map(|p| p.display().to_string())
                 .unwrap_or_default();
 
+            // Get tab ID before save for cleanup
+            let tab_id = self.state.active_tab().map(|t| t.id);
+
             match self.state.save_active_tab() {
                 Ok(_) => {
                     debug!("File saved successfully");
                     let time = self.get_app_time();
                     self.state
                         .show_toast(format!("Saved: {}", path_display), time, 3.0);
+                    
+                    // Clean up auto-save temp file after successful manual save
+                    if let Some(id) = tab_id {
+                        self.cleanup_auto_save_for_tab(id);
+                    }
                 }
                 Err(e) => {
                     warn!("Failed to save file: {}", e);
@@ -1428,11 +2653,27 @@ impl FerriteApp {
         // Open the native save dialog
         if let Some(path) = save_file_dialog(initial_dir.as_ref(), Some(&default_name)) {
             info!("Saving file as: {}", path.display());
+            
+            // Get old path and tab ID before save for cleanup
+            let old_path = self.state.active_tab().and_then(|t| t.path.clone());
+            let tab_id = self.state.active_tab().map(|t| t.id);
+
             match self.state.save_active_tab_as(path.clone()) {
                 Ok(_) => {
                     let time = self.get_app_time();
                     self.state
                         .show_toast(format!("Saved: {}", path.display()), time, 3.0);
+                    
+                    // Clean up auto-save temp files after successful manual save
+                    // (both old path and new path, in case they differ)
+                    if let Some(id) = tab_id {
+                        use crate::config::delete_auto_save;
+                        // Clean up old path's auto-save
+                        delete_auto_save(id, old_path.as_ref());
+                        // Clean up new path's auto-save (in case it exists)
+                        delete_auto_save(id, Some(&path));
+                        debug!("Cleaned up auto-save temp files for tab {}", id);
+                    }
                 }
                 Err(e) => {
                     warn!("Failed to save file: {}", e);
@@ -1549,6 +2790,64 @@ impl FerriteApp {
             let time = self.get_app_time();
             self.state
                 .show_toast("Open a folder first to use search in files", time, 2.0);
+        }
+    }
+
+    /// Handle navigation from a search-in-files result click.
+    ///
+    /// This opens the file (if not already open), scrolls to the match location,
+    /// applies a transient highlight, and switches to Raw mode if necessary.
+    fn handle_search_navigation(&mut self, target: SearchNavigationTarget) {
+        let file_path = target.path.clone();
+
+        // Open the file (or switch to existing tab)
+        match self.state.open_file(file_path.clone()) {
+            Ok(_) => {
+                debug!(
+                    "Opened file from search: {} at line {}, char offset {}",
+                    file_path.display(),
+                    target.line_number,
+                    target.char_offset
+                );
+
+                // Get the active tab and apply navigation
+                if let Some(tab) = self.state.active_tab_mut() {
+                    // Switch to Raw mode if currently in Rendered mode
+                    // (search results are based on raw text positions)
+                    if tab.view_mode == ViewMode::Rendered {
+                        tab.view_mode = ViewMode::Raw;
+                        debug!("Switched to Raw mode for search navigation");
+                    }
+
+                    // Clear any existing transient highlight from previous navigations
+                    tab.clear_transient_highlight();
+
+                    // Set the transient highlight for the matched text
+                    let highlight_end = target.char_offset + target.match_len;
+                    tab.set_transient_highlight(target.char_offset, highlight_end);
+
+                    // Set cursor position to the match location
+                    tab.set_cursor(target.char_offset);
+
+                    // Schedule scroll to the target line (editor will handle this)
+                    self.pending_scroll_to_line = Some(target.line_number);
+
+                    debug!(
+                        "Set transient highlight at {}..{} and scroll to line {}",
+                        target.char_offset, highlight_end, target.line_number
+                    );
+                }
+
+                // Add to workspace recent files
+                if let Some(workspace) = self.state.workspace_mut() {
+                    workspace.add_recent_file(file_path);
+                }
+            }
+            Err(e) => {
+                warn!("Failed to open file from search: {}", e);
+                self.state
+                    .show_error(format!("Failed to open file:\n{}", e));
+            }
         }
     }
 
@@ -2004,6 +3303,12 @@ impl FerriteApp {
                 return Some(KeyboardAction::OpenFindReplace);
             }
 
+            // Ctrl+D: Select next occurrence (multi-cursor)
+            if i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::D) {
+                debug!("Keyboard shortcut: Ctrl+D (Select Next Occurrence)");
+                return Some(KeyboardAction::SelectNextOccurrence);
+            }
+
             // F1: Open About/Help panel
             if i.key_pressed(egui::Key::F1) {
                 debug!("Keyboard shortcut: F1 (Open About)");
@@ -2020,6 +3325,18 @@ impl FerriteApp {
             if i.key_pressed(egui::Key::F3) && i.modifiers.shift {
                 debug!("Keyboard shortcut: Shift+F3 (Find Previous)");
                 return Some(KeyboardAction::FindPrev);
+            }
+
+            // F11: Toggle Zen Mode
+            if i.key_pressed(egui::Key::F11) {
+                debug!("Keyboard shortcut: F11 (Toggle Zen Mode)");
+                return Some(KeyboardAction::ToggleZenMode);
+            }
+
+            // Ctrl+Shift+L: Toggle Live Pipeline panel (JSON/YAML only)
+            if i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::L) {
+                debug!("Keyboard shortcut: Ctrl+Shift+L (Toggle Pipeline)");
+                return Some(KeyboardAction::TogglePipeline);
             }
 
             // ═══════════════════════════════════════════════════════════════════
@@ -2138,10 +3455,30 @@ impl FerriteApp {
                 }
             }
 
-            // Escape: Close find panel (if open)
+            // Escape: Exit multi-cursor mode or close find panel
             if i.key_pressed(egui::Key::Escape) {
-                debug!("Keyboard shortcut: Escape (Close Find Panel)");
-                return Some(KeyboardAction::CloseFindPanel);
+                // Priority: exit multi-cursor mode first if active
+                debug!("Keyboard shortcut: Escape");
+                return Some(KeyboardAction::ExitMultiCursor);
+            }
+
+            // Code Folding shortcuts
+            // Ctrl+Shift+[: Fold all
+            if i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::OpenBracket) {
+                debug!("Keyboard shortcut: Ctrl+Shift+[ (Fold All)");
+                return Some(KeyboardAction::FoldAll);
+            }
+
+            // Ctrl+Shift+]: Unfold all
+            if i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::CloseBracket) {
+                debug!("Keyboard shortcut: Ctrl+Shift+] (Unfold All)");
+                return Some(KeyboardAction::UnfoldAll);
+            }
+
+            // Ctrl+Shift+.: Toggle fold at cursor
+            if i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::Period) {
+                debug!("Keyboard shortcut: Ctrl+Shift+. (Toggle Fold at Cursor)");
+                return Some(KeyboardAction::ToggleFoldAtCursor);
             }
 
             None
@@ -2195,11 +3532,6 @@ impl FerriteApp {
             KeyboardAction::FindPrev => {
                 self.handle_find_prev();
             }
-            KeyboardAction::CloseFindPanel => {
-                if self.state.ui.show_find_replace {
-                    self.state.ui.show_find_replace = false;
-                }
-            }
             KeyboardAction::Format(cmd) => {
                 self.handle_format_command(cmd);
             }
@@ -2217,6 +3549,53 @@ impl FerriteApp {
             }
             KeyboardAction::ExportHtml => {
                 self.handle_export_html(ctx);
+            }
+            KeyboardAction::SelectNextOccurrence => {
+                self.handle_select_next_occurrence();
+            }
+            KeyboardAction::ExitMultiCursor => {
+                // Exit multi-cursor mode if active, otherwise close find panel
+                if let Some(tab) = self.state.active_tab_mut() {
+                    if tab.has_multiple_cursors() {
+                        debug!("Exiting multi-cursor mode");
+                        tab.exit_multi_cursor_mode();
+                    } else if self.state.ui.show_find_replace {
+                        self.state.ui.show_find_replace = false;
+                    }
+                } else if self.state.ui.show_find_replace {
+                    self.state.ui.show_find_replace = false;
+                }
+            }
+            KeyboardAction::ToggleZenMode => {
+                self.handle_toggle_zen_mode();
+            }
+            KeyboardAction::FoldAll => {
+                if self.state.settings.folding_enabled {
+                    if let Some(tab) = self.state.active_tab_mut() {
+                        tab.fold_all();
+                        debug!("Folded all regions");
+                    }
+                }
+            }
+            KeyboardAction::UnfoldAll => {
+                if self.state.settings.folding_enabled {
+                    if let Some(tab) = self.state.active_tab_mut() {
+                        tab.unfold_all();
+                        debug!("Unfolded all regions");
+                    }
+                }
+            }
+            KeyboardAction::ToggleFoldAtCursor => {
+                if self.state.settings.folding_enabled {
+                    if let Some(tab) = self.state.active_tab_mut() {
+                        // Convert cursor position to line number (0-indexed)
+                        let cursor_line = tab.cursor_position.0;
+                        tab.toggle_fold_at_line(cursor_line);
+                    }
+                }
+            }
+            KeyboardAction::TogglePipeline => {
+                self.handle_toggle_pipeline();
             }
         });
     }
@@ -2247,87 +3626,201 @@ impl FerriteApp {
         }
     }
 
-    /// Toggle between Raw and Rendered view modes for the active tab.
+    /// Toggle view modes for the active tab.
+    ///
+    /// For markdown files: cycles Raw → Split → Rendered → Raw
+    /// For structured files (JSON, YAML, TOML): cycles Raw ↔ Rendered (no Split mode)
     ///
     /// When sync scrolling is enabled, this calculates the corresponding scroll
-    /// position in the target mode based on the current scroll position.
+    /// position in the target mode using line-to-position mapping for accuracy.
     fn handle_toggle_view_mode(&mut self) {
-        // Get sync scroll setting before mutable borrow
+        // Get sync scroll setting and file type before mutable borrow
         let sync_enabled = self.state.settings.sync_scroll_enabled;
+        let is_structured = self.state.active_tab()
+            .and_then(|t| t.path.as_ref())
+            .map(|p| FileType::from_path(p).is_structured())
+            .unwrap_or(false);
 
         if let Some(tab) = self.state.active_tab_mut() {
             let old_mode = tab.view_mode;
-            let tab_id = tab.id;
             let current_scroll = tab.scroll_offset;
-            let content = tab.content.clone();
+            let line_mappings = tab.rendered_line_mappings.clone();
 
             // Debug: log the current state before toggle
             debug!(
-                "Toggle view mode: old_mode={:?}, current_scroll={}, sync_enabled={}",
-                old_mode, current_scroll, sync_enabled
+                "Toggle view mode: old_mode={:?}, current_scroll={}, sync_enabled={}, mappings_count={}, is_structured={}",
+                old_mode, current_scroll, sync_enabled, line_mappings.len(), is_structured
             );
 
             // Toggle the view mode
             let new_mode = tab.toggle_view_mode();
+            
+            // For structured files, skip Split mode (not supported)
+            let new_mode = if is_structured && new_mode == ViewMode::Split {
+                tab.toggle_view_mode() // Toggle again to skip Split
+            } else {
+                new_mode
+            };
+            
             debug!("View mode toggled to: {:?} for tab {}", new_mode, tab.id);
 
             // Handle sync scrolling when switching modes
-            if sync_enabled {
-                let sync_state = self.sync_scroll_states.entry(tab_id).or_default();
-
-                // Update source metadata for proportional fallback
-                let line_count = content.lines().count().max(1);
-                sync_state.set_source_metadata(line_count, line_count as f32 * 20.0); // Approximate
-
-                // Calculate target scroll position based on mode switch
-                match (old_mode, new_mode) {
-                    (ViewMode::Raw, ViewMode::Rendered) => {
-                        // Going from Raw to Rendered
-                        sync_state.update_raw_offset(current_scroll);
-                        sync_state.mark_scroll(ScrollOrigin::Raw);
-
-                        // Estimate line height (will be refined when editor renders)
-                        let estimated_line_height = 20.0; // Approximate
-                        let source_line =
-                            sync_state.raw_offset_to_line(current_scroll, estimated_line_height);
-                        let target_offset = sync_state.line_to_rendered_offset(source_line);
-
-                        // Set pending scroll target for rendered view
-                        self.pending_scroll_to_line = Some(source_line);
-
-                        debug!(
-                            "Sync scroll Raw→Rendered: offset {} → line {} → target offset {}",
-                            current_scroll, source_line, target_offset
-                        );
+            // Note: Split mode shows both panes, so scroll sync is handled in real-time
+            if sync_enabled && new_mode != ViewMode::Split && old_mode != ViewMode::Split {
+                let content_height = tab.content_height;
+                let viewport_height = tab.viewport_height;
+                let max_scroll = (content_height - viewport_height).max(0.0);
+                
+                // Check if we're at boundaries (within 5px tolerance)
+                let at_top = current_scroll < 5.0;
+                let at_bottom = max_scroll > 0.0 && (max_scroll - current_scroll) < 5.0;
+                
+                if at_top {
+                    // At top - stay at top
+                    tab.pending_scroll_offset = Some(0.0);
+                    debug!("Sync scroll: at top, staying at top");
+                } else if at_bottom {
+                    // At bottom - use ratio to stay at bottom
+                    tab.pending_scroll_ratio = Some(1.0);
+                    debug!("Sync scroll: at bottom, using ratio=1.0");
+                } else {
+                    // In the middle - use line-based mapping for content preservation
+                    match (old_mode, new_mode) {
+                        (ViewMode::Raw, ViewMode::Rendered) => {
+                            // Calculate which line is at the top of viewport
+                            let line_height = tab.raw_line_height;
+                            let topmost_line = if line_height > 0.0 {
+                                ((current_scroll / line_height) as usize).saturating_add(1)
+                            } else {
+                                1
+                            };
+                            
+                            // Store for line-based lookup after render
+                            tab.pending_scroll_to_line = Some(topmost_line);
+                            debug!(
+                                "Sync scroll Raw→Rendered: scroll={} / line_height={:.1} → line {}",
+                                current_scroll, line_height, topmost_line
+                            );
+                        }
+                        (ViewMode::Rendered, ViewMode::Raw) => {
+                            // Find which line is at current scroll position using mappings
+                            if let Some(source_line) = Self::find_source_line_for_rendered_y_interpolated(
+                                &line_mappings,
+                                current_scroll,
+                                content_height,
+                            ) {
+                                // Calculate target scroll in Raw mode
+                                let line_height = tab.raw_line_height.max(20.0);
+                                let target_scroll = (source_line.saturating_sub(1) as f32) * line_height;
+                                tab.pending_scroll_offset = Some(target_scroll);
+                                debug!(
+                                    "Sync scroll Rendered→Raw: scroll={} → line {} → raw_offset={:.1}",
+                                    current_scroll, source_line, target_scroll
+                                );
+                            } else {
+                                // Fallback to percentage if no mappings
+                                let scroll_ratio = if max_scroll > 0.0 {
+                                    (current_scroll / max_scroll).clamp(0.0, 1.0)
+                                } else {
+                                    0.0
+                                };
+                                tab.pending_scroll_ratio = Some(scroll_ratio);
+                                debug!(
+                                    "Sync scroll Rendered→Raw: no mappings, using ratio={:.3}",
+                                    scroll_ratio
+                                );
+                            }
+                        }
+                        _ => {}
                     }
-                    (ViewMode::Rendered, ViewMode::Raw) => {
-                        // Going from Rendered to Raw
-                        sync_state.update_rendered_offset(current_scroll);
-                        sync_state.mark_scroll(ScrollOrigin::Rendered);
-
-                        // For Rendered→Raw, use proportional estimation based on scroll position
-                        // Since rendered content may have variable heights (headings, code blocks),
-                        // we estimate using the same approach as Raw: offset / estimated_line_height
-                        let estimated_line_height = 20.0;
-                        let source_line = ((current_scroll / estimated_line_height) as usize)
-                            .saturating_add(1)
-                            .max(1);
-
-                        // Set pending scroll target for raw view
-                        self.pending_scroll_to_line = Some(source_line);
-
-                        debug!(
-                            "Sync scroll Rendered→Raw: offset {} → line {} (line_count={}, scroll_offset_was={})",
-                            current_scroll, source_line, line_count, current_scroll
-                        );
-                    }
-                    _ => {}
                 }
             }
 
             // Mark settings dirty to save per-tab view mode on exit
             self.state.mark_settings_dirty();
         }
+    }
+    
+    /// Find the rendered Y position for a given source line using interpolated line mappings.
+    /// This provides sub-element precision by interpolating within elements.
+    fn find_rendered_y_for_line_interpolated(
+        mappings: &[(usize, usize, f32)],
+        line: usize,
+        content_height: f32,
+    ) -> Option<f32> {
+        if mappings.is_empty() {
+            return None;
+        }
+        
+        // Find the element containing this line
+        for (i, (start, end, y)) in mappings.iter().enumerate() {
+            if line >= *start && line <= *end {
+                // Found the element - now interpolate within it
+                let element_height = if i + 1 < mappings.len() {
+                    mappings[i + 1].2 - y  // Next element's Y - this element's Y
+                } else {
+                    (content_height - y).max(20.0)  // Last element - use remaining height
+                };
+                
+                // Calculate progress within the element (0.0 to 1.0)
+                let line_span = (*end - *start + 1) as f32;
+                let progress = if line_span > 1.0 {
+                    (line - *start) as f32 / line_span
+                } else {
+                    0.0
+                };
+                
+                return Some(y + progress * element_height);
+            }
+        }
+        
+        // Line is beyond all mappings - return end position
+        if let Some((_, _, y)) = mappings.last() {
+            return Some(*y);
+        }
+        
+        None
+    }
+
+    /// Find the source line for a given rendered Y position using interpolated line mappings.
+    fn find_source_line_for_rendered_y_interpolated(
+        mappings: &[(usize, usize, f32)],
+        rendered_y: f32,
+        content_height: f32,
+    ) -> Option<usize> {
+        if mappings.is_empty() {
+            return None;
+        }
+        
+        // Find the element at this Y position
+        for (i, (start, end, y)) in mappings.iter().enumerate() {
+            let next_y = if i + 1 < mappings.len() {
+                mappings[i + 1].2
+            } else {
+                content_height
+            };
+            
+            if rendered_y >= *y && rendered_y < next_y {
+                // Found the element - interpolate to find the line
+                let element_height = next_y - y;
+                let progress = if element_height > 0.0 {
+                    (rendered_y - y) / element_height
+                } else {
+                    0.0
+                };
+                
+                let line_span = (*end - *start + 1) as f32;
+                let line = *start + (progress * line_span) as usize;
+                return Some(line.min(*end));
+            }
+        }
+        
+        // Beyond all mappings - return last line
+        if let Some((_, end, _)) = mappings.last() {
+            return Some(*end);
+        }
+        
+        None
     }
 
     /// Set the application theme and apply it immediately.
@@ -2462,6 +3955,73 @@ impl FerriteApp {
             "Outline panel toggled: {}",
             self.state.settings.outline_enabled
         );
+    }
+
+    /// Toggle Zen Mode (distraction-free writing).
+    fn handle_toggle_zen_mode(&mut self) {
+        self.state.toggle_zen_mode();
+        self.state.mark_settings_dirty();
+
+        let time = self.get_app_time();
+        if self.state.is_zen_mode() {
+            self.state.show_toast("Zen Mode enabled", time, 1.5);
+            info!("Zen Mode enabled");
+        } else {
+            self.state.show_toast("Zen Mode disabled", time, 1.5);
+            info!("Zen Mode disabled");
+        }
+    }
+
+    /// Toggle the Live Pipeline panel for the active tab (JSON/YAML only).
+    fn handle_toggle_pipeline(&mut self) {
+        // Check if pipeline feature is enabled
+        if !self.state.settings.pipeline_enabled {
+            let time = self.get_app_time();
+            self.state.show_toast("Pipeline feature is disabled", time, 2.0);
+            return;
+        }
+
+        // Check if we're in Zen Mode (pipeline hidden in Zen Mode)
+        if self.state.is_zen_mode() {
+            let time = self.get_app_time();
+            self.state.show_toast("Pipeline panel hidden in Zen Mode", time, 2.0);
+            return;
+        }
+
+        // Check if file type supports pipeline before getting mutable borrow
+        let supports = self.state.active_tab().map(|t| t.supports_pipeline()).unwrap_or(false);
+        if !supports {
+            let file_type_name = self.state.active_tab()
+                .map(|t| t.file_type().display_name().to_string())
+                .unwrap_or_else(|| "Unknown".to_string());
+            let time = self.get_app_time();
+            self.state.show_toast(
+                &format!("Pipeline only available for JSON/YAML (current: {})", file_type_name),
+                time,
+                2.5,
+            );
+            return;
+        }
+
+        // Toggle the pipeline panel and get the result
+        let (is_visible, tab_id) = {
+            if let Some(tab) = self.state.active_tab_mut() {
+                tab.toggle_pipeline_panel();
+                (tab.pipeline_visible(), tab.id)
+            } else {
+                return;
+            }
+        };
+
+        // Show toast after the mutable borrow is released
+        let time = self.get_app_time();
+        if is_visible {
+            self.state.show_toast("Pipeline panel opened", time, 1.5);
+            info!("Pipeline panel opened for tab {}", tab_id);
+        } else {
+            self.state.show_toast("Pipeline panel closed", time, 1.5);
+            info!("Pipeline panel closed for tab {}", tab_id);
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -2820,6 +4380,66 @@ impl FerriteApp {
         }
     }
 
+    /// Handle Ctrl+D: Select next occurrence of current word/selection.
+    ///
+    /// VS Code-style behavior:
+    /// - If no selection: select the word under cursor
+    /// - If selection exists: find next occurrence and add cursor there
+    fn handle_select_next_occurrence(&mut self) {
+        let Some(tab) = self.state.active_tab_mut() else {
+            return;
+        };
+
+        // Get the text to search for
+        let search_text = match tab.get_primary_selection_text() {
+            Some(text) if !text.is_empty() => text,
+            _ => {
+                // No word at cursor, try to select word under cursor first
+                let primary_pos = tab.cursors.primary().head;
+                if let Some((start, end)) = tab.word_range_at_position(primary_pos) {
+                    // Select the word under cursor
+                    tab.set_selection(start, end);
+                    debug!("Selected word at cursor: {}..{}", start, end);
+                }
+                return;
+            }
+        };
+
+        // Get the last selection's end position to search from
+        let search_from = {
+            let selections = tab.cursors.selections();
+            // Find the rightmost selection to search after
+            selections
+                .iter()
+                .map(|s| s.end())
+                .max()
+                .unwrap_or(0)
+        };
+
+        // Find next occurrence that doesn't overlap with existing selections
+        if let Some((start, end)) = tab.find_next_occurrence(&search_text, search_from) {
+            // Check if this occurrence is already selected
+            let already_selected = tab.cursors.selections().iter().any(|s| {
+                s.start() == start && s.end() == end
+            });
+
+            if !already_selected {
+                // Add new selection
+                tab.add_selection(start, end);
+                debug!(
+                    "Added selection at {}..{}, now {} cursor(s)",
+                    start,
+                    end,
+                    tab.cursor_count()
+                );
+            } else {
+                debug!("All occurrences already selected");
+            }
+        } else {
+            debug!("No more occurrences found for '{}'", search_text);
+        }
+    }
+
     /// Handle replace current match action.
     fn handle_replace_current(&mut self) {
         if let Some(tab) = self.state.active_tab() {
@@ -2913,6 +4533,16 @@ impl FerriteApp {
                 debug!("Ribbon: Save As");
                 self.handle_save_as_file();
             }
+            RibbonAction::ToggleAutoSave => {
+                debug!("Ribbon: Toggle Auto-Save");
+                if let Some(tab) = self.state.active_tab_mut() {
+                    tab.toggle_auto_save();
+                    info!("Auto-save {} for tab {}", 
+                        if tab.auto_save_enabled { "enabled" } else { "disabled" },
+                        tab.id
+                    );
+                }
+            }
 
             // Edit operations
             RibbonAction::Undo => {
@@ -2973,6 +4603,18 @@ impl FerriteApp {
             RibbonAction::ToggleCollapse => {
                 debug!("Ribbon: Toggle collapse");
                 self.ribbon.toggle_collapsed();
+            }
+
+            // Zen Mode
+            RibbonAction::ToggleZenMode => {
+                debug!("Ribbon: Toggle Zen Mode");
+                self.handle_toggle_zen_mode();
+            }
+
+            // Live Pipeline
+            RibbonAction::TogglePipeline => {
+                debug!("Ribbon: Toggle Pipeline");
+                self.handle_toggle_pipeline();
             }
 
             // Export operations (Markdown)
@@ -3205,6 +4847,18 @@ impl eframe::App for FerriteApp {
         // Poll file watcher for workspace changes
         self.handle_file_watcher_events();
 
+        // Periodic session save for crash recovery
+        self.update_session_recovery();
+
+        // Process auto-save for tabs that need it
+        self.process_auto_saves();
+
+        // Show recovery dialog if we had a crash with unsaved changes
+        self.show_recovery_dialog_if_needed(ctx);
+
+        // Show auto-save recovery dialog if there's a pending recovery
+        self.show_auto_save_recovery_dialog(ctx);
+
         // Handle close request from window
         if ctx.input(|i| i.viewport().close_requested()) && !self.handle_close_request() {
             // Cancel the close request - we need to show a confirmation dialog
@@ -3231,7 +4885,28 @@ impl eframe::App for FerriteApp {
 
     /// Called when the application is about to close.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        use crate::config::{
+            clear_all_recovery_data, remove_lock_file, save_session_state,
+        };
+
         info!("Application exiting");
+
+        // Capture and save session state for next startup
+        let mut session_state = self.state.capture_session_state();
+        session_state.mark_clean_shutdown();
+        
+        if save_session_state(&session_state) {
+            info!("Session state saved for next startup");
+            // Clear recovery data since we had a clean shutdown
+            clear_all_recovery_data();
+        } else {
+            warn!("Failed to save session state");
+        }
+
+        // Remove lock file to indicate clean shutdown
+        remove_lock_file();
+
+        // Save settings
         self.state.shutdown();
     }
 

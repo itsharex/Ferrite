@@ -21,7 +21,7 @@
 #![allow(dead_code)]
 
 use eframe::egui::{Color32, FontId, RichText};
-use log::{debug, warn};
+use log::{debug, trace, warn};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Style, Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
@@ -251,7 +251,8 @@ impl SyntaxHighlighter {
             }
             None => {
                 // Language not recognized, return plain text
-                debug!("No syntax found for language: {}", language);
+                // Use trace level to avoid spam - this is expected for unlabeled code blocks
+                trace!("No syntax found for language: {}", language);
                 let default_color = theme
                     .settings
                     .foreground
@@ -446,6 +447,85 @@ pub fn highlight_code_with_theme(
     let highlighter = get_highlighter();
     let theme = highlighter.get_theme_by_name_or_mode(theme_name, dark_mode);
     highlighter.highlight_code(code, language, theme)
+}
+
+/// Get the language identifier for a file path extension.
+///
+/// Returns the file extension as a language identifier that can be passed
+/// to `highlight_code`. Returns None for unknown or unsupported extensions.
+///
+/// # Arguments
+/// * `path` - The file path to check
+///
+/// # Returns
+/// Some(language) if the file extension is recognized, None otherwise.
+pub fn language_from_path(path: &std::path::Path) -> Option<String> {
+    let ext = path.extension()?.to_str()?.to_lowercase();
+    
+    // Check if syntect can handle this extension
+    let highlighter = get_highlighter();
+    if highlighter.syntax_set().find_syntax_by_extension(&ext).is_some() {
+        return Some(ext);
+    }
+    
+    // Map common extensions that might not be found by direct lookup
+    let mapped = match ext.as_str() {
+        "rs" => "rust",
+        "py" => "python",
+        "js" => "javascript",
+        "ts" => "typescript",
+        "tsx" => "tsx",
+        "jsx" => "jsx",
+        "cpp" | "cxx" | "cc" | "hpp" => "cpp",
+        "c" | "h" => "c",
+        "cs" => "csharp",
+        "go" => "go",
+        "rb" => "ruby",
+        "php" => "php",
+        "swift" => "swift",
+        "kt" | "kts" => "kotlin",
+        "java" => "java",
+        "scala" => "scala",
+        "sh" | "bash" | "zsh" => "sh",
+        "ps1" => "powershell",
+        "sql" => "sql",
+        "html" | "htm" => "html",
+        "css" => "css",
+        "scss" => "scss",
+        "sass" => "sass",
+        "less" => "less",
+        "json" => "json",
+        "yaml" | "yml" => "yaml",
+        "toml" => "toml",
+        "xml" => "xml",
+        "lua" => "lua",
+        "pl" | "pm" => "perl",
+        "r" => "r",
+        "hs" => "haskell",
+        "ex" | "exs" => "elixir",
+        "erl" => "erlang",
+        "clj" | "cljs" => "clojure",
+        "vim" => "vim",
+        "diff" | "patch" => "diff",
+        "ini" | "cfg" => "ini",
+        "cmake" => "cmake",
+        "dockerfile" => "dockerfile",
+        "makefile" | "mk" => "makefile",
+        _ => return None,
+    };
+    
+    Some(mapped.to_string())
+}
+
+/// Check if a file path has a syntax that can be highlighted.
+///
+/// # Arguments
+/// * `path` - The file path to check
+///
+/// # Returns
+/// true if the file can be syntax highlighted, false otherwise.
+pub fn can_highlight_file(path: &std::path::Path) -> bool {
+    language_from_path(path).is_some()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

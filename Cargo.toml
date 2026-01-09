@@ -1,6 +1,6 @@
 [package]
 name = "ferrite"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "A fast, lightweight text editor for Markdown, JSON, and more"
 repository = "https://github.com/OlaProeis/Ferrite"
@@ -35,6 +35,9 @@ notify = { version = "6", default-features = false, features = ["macos_kqueue"] 
 fuzzy-matcher = "0.3"
 walkdir = "2"
 
+# Git integration
+git2 = "0.19"
+
 # Icon loading
 image = { version = "0.25", default-features = false, features = ["png"] }
 
@@ -56,3 +59,43 @@ opt-level = "z"       # Optimize for size (use "3" for speed)
 # Development profile with some optimizations for faster testing
 [profile.dev.package."*"]
 opt-level = 2         # Optimize dependencies in dev builds
+
+# ============================================================================
+# Linux .deb package configuration (cargo-deb)
+# Build with: cargo deb
+# ============================================================================
+[package.metadata.deb]
+name = "ferrite-editor"
+maintainer = "OlaProeis <olaproeis@users.noreply.github.com>"
+copyright = "2024-2025, OlaProeis"
+license-file = ["LICENSE", "0"]
+extended-description = """Ferrite is a fast, lightweight text editor built with Rust and egui.
+Features include:
+- Markdown editing with live preview
+- Split view (raw + rendered side-by-side)
+- JSON/YAML/TOML tree viewer
+- MermaidJS diagram rendering
+- Git integration with file status indicators
+- Syntax highlighting for code blocks
+- Zen mode for distraction-free writing
+- Session persistence and auto-save"""
+section = "editors"
+priority = "optional"
+depends = "$auto"
+assets = [
+    # Binary
+    ["target/release/ferrite", "usr/bin/ferrite", "755"],
+    # Desktop entry
+    ["assets/icons/linux/ferrite.desktop", "usr/share/applications/ferrite.desktop", "644"],
+    # Icons at various sizes
+    ["assets/icons/icon_16.png", "usr/share/icons/hicolor/16x16/apps/ferrite.png", "644"],
+    ["assets/icons/icon_32.png", "usr/share/icons/hicolor/32x32/apps/ferrite.png", "644"],
+    ["assets/icons/icon_48.png", "usr/share/icons/hicolor/48x48/apps/ferrite.png", "644"],
+    ["assets/icons/icon_64.png", "usr/share/icons/hicolor/64x64/apps/ferrite.png", "644"],
+    ["assets/icons/icon_128.png", "usr/share/icons/hicolor/128x128/apps/ferrite.png", "644"],
+    ["assets/icons/icon_256.png", "usr/share/icons/hicolor/256x256/apps/ferrite.png", "644"],
+    ["assets/icons/icon_512.png", "usr/share/icons/hicolor/512x512/apps/ferrite.png", "644"],
+    # Documentation
+    ["README.md", "usr/share/doc/ferrite-editor/README.md", "644"],
+    ["LICENSE", "usr/share/doc/ferrite-editor/LICENSE", "644"],
+]

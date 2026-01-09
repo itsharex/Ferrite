@@ -1,291 +1,78 @@
 # Syntax Highlighting
 
-This document describes the syntax highlighting system for fenced code blocks in Ferrite.
+Full-file syntax highlighting for source code files in Ferrite's raw editor mode.
 
 ## Overview
 
-The syntax highlighting feature uses **syntect** (v5.1) to provide syntax-aware coloring for code blocks in the rendered/WYSIWYG editor mode. This enhances code readability by applying theme-consistent colors to language constructs like keywords, strings, comments, and operators.
-
-## Code Block UI Features
-
-Code blocks in the WYSIWYG editor include:
-
-- **Visible Background**: Light gray (`#E9ECEF`) in light mode, dark (`#23272E`) in dark mode
-- **Border**: Subtle border with rounded corners (6px)
-- **Header Row**: Language label (left) + Copy button (right)
-- **Copy Button** (📋): One-click clipboard copy with tooltip
-- **Separator**: Visual divider between header and code
-- **Click-to-Edit**: Click anywhere in code to enter edit mode
-
-## Architecture
-
-### Module Structure
-
-```
-src/markdown/
-├── syntax.rs      # Syntax highlighting module
-├── editor.rs      # WYSIWYG editor (consumes highlighting)
-└── mod.rs         # Module exports
-```
-
-### Key Components
-
-#### `SyntaxHighlighter`
-
-The main struct that manages syntax and theme sets:
-
-```rust
-pub struct SyntaxHighlighter {
-    syntax_set: SyntaxSet,    // Loaded syntax definitions
-    theme_set: ThemeSet,      // Loaded color themes
-}
-```
-
-**Key Methods:**
-- `new()` - Creates highlighter with default syntaxes and themes
-- `highlight_code(code, language, theme)` - Highlights code with specific theme
-- `highlight_code_for_mode(code, language, dark_mode)` - Auto-selects theme based on mode
-- `get_theme_for_mode(dark_mode)` - Returns appropriate theme for dark/light mode
-- `find_syntax_for_language(language)` - Maps language identifier to syntax definition
-
-#### `HighlightedLine` and `HighlightedSegment`
-
-Represents highlighted output:
-
-```rust
-pub struct HighlightedLine {
-    pub segments: Vec<HighlightedSegment>,
-}
-
-pub struct HighlightedSegment {
-    pub text: String,
-    pub foreground: Color32,
-    pub bold: bool,
-    pub italic: bool,
-    pub underline: bool,
-}
-```
-
-#### Global Highlighter
-
-A lazy-initialized global instance avoids repeated loading overhead:
-
-```rust
-static HIGHLIGHTER: OnceLock<SyntaxHighlighter> = OnceLock::new();
-
-pub fn get_highlighter() -> &'static SyntaxHighlighter {
-    HIGHLIGHTER.get_or_init(SyntaxHighlighter::new)
-}
-```
-
-## Usage
-
-### Basic Usage
-
-```rust
-use crate::markdown::syntax::{highlight_code, highlight_code_with_theme};
-
-// Highlight with automatic theme selection
-let lines = highlight_code("fn main() {}", "rust", true); // dark mode
-
-// Highlight with specific theme
-let lines = highlight_code_with_theme(
-    "print('hello')",
-    "python",
-    "base16-ocean.dark",
-    true
-);
-```
-
-### In WYSIWYG Editor
-
-The `render_code_block` function in `editor.rs` uses syntax highlighting:
-
-```rust
-fn render_code_block(ui, source, edit_state, colors, font_size, language, literal, node) {
-    let dark_mode = colors.background.r() < 128;
-    let highlighted_lines = highlight_code(&code, language, dark_mode);
-    
-    for line in &highlighted_lines {
-        ui.horizontal(|ui| {
-            for segment in &line.segments {
-                ui.label(segment.to_rich_text(font_size));
-            }
-        });
-    }
-}
-```
-
-### Converting to egui RichText
-
-```rust
-let segment = HighlightedSegment {
-    text: "let".to_string(),
-    foreground: Color32::from_rgb(198, 120, 221),
-    bold: true,
-    italic: false,
-    underline: false,
-};
-
-// Convert to egui RichText
-let rich_text = segment.to_rich_text(14.0);
-ui.label(rich_text);
-```
+Ferrite now supports syntax highlighting for source code files (Rust, Python, JavaScript, etc.) in the raw editor mode. This feature uses the existing `syntect` library that was previously only used for code blocks in markdown preview.
 
 ## Supported Languages
 
-The highlighter supports 50+ languages via syntect's default syntax set. Common languages are mapped through aliases:
+The following file extensions are supported:
 
-| Alias(es) | Extension | Language |
-|-----------|-----------|----------|
-| rust, rs | rs | Rust |
-| python, py | py | Python |
-| javascript, js | js | JavaScript |
-| typescript, ts | ts | TypeScript |
-| cpp, c++, cxx | cpp | C++ |
-| csharp, c#, cs | cs | C# |
-| java | java | Java |
-| go, golang | go | Go |
-| ruby, rb | rb | Ruby |
-| php | php | PHP |
-| swift | swift | Swift |
-| kotlin, kt | kt | Kotlin |
-| html, htm | html | HTML |
-| css | css | CSS |
-| json | json | JSON |
-| yaml, yml | yaml | YAML |
-| toml | toml | TOML |
-| sql | sql | SQL |
-| shell, sh, bash, zsh | sh | Shell |
-| markdown, md | md | Markdown |
-| ... | ... | ... |
+| Category | Extensions |
+|----------|------------|
+| **Systems** | `.rs` (Rust), `.c`, `.cpp`, `.h`, `.hpp`, `.go`, `.swift` |
+| **Web** | `.js`, `.ts`, `.tsx`, `.jsx`, `.html`, `.css`, `.scss`, `.sass`, `.less` |
+| **Scripting** | `.py`, `.rb`, `.php`, `.lua`, `.pl`, `.sh`, `.bash`, `.ps1` |
+| **JVM** | `.java`, `.kt`, `.scala`, `.clj` |
+| **Data** | `.json`, `.yaml`, `.yml`, `.toml`, `.xml` |
+| **Functional** | `.hs`, `.ex`, `.exs`, `.erl` |
+| **Other** | `.sql`, `.vim`, `.diff`, `.ini`, `.cmake`, `.dockerfile`, `.makefile` |
 
-Unknown languages fall back to plain text display with the theme's default foreground color.
+## Usage
 
-## Theme Integration
+### Enabling/Disabling
 
-### Built-in Themes
+1. Open Settings (Ctrl+,)
+2. Navigate to the **Editor** section
+3. Toggle **Syntax Highlighting** checkbox
 
-| Theme Name | Mode | Description |
-|------------|------|-------------|
-| `base16-ocean.dark` | Dark | Default dark theme |
-| `base16-eighties.dark` | Dark | Eighties-inspired dark |
-| `InspiredGitHub` | Light | GitHub-inspired light |
-| `Solarized (dark)` | Dark | Solarized dark |
-| `Solarized (light)` | Light | Solarized light |
+The setting is enabled by default.
 
-### Default Theme Selection
+### How It Works
 
-```rust
-pub const DEFAULT_DARK_THEME: &str = "base16-ocean.dark";
-pub const DEFAULT_LIGHT_THEME: &str = "InspiredGitHub";
-```
+- When you open a source code file, Ferrite detects the language from the file extension
+- If syntax highlighting is enabled and the language is recognized, the editor applies colored text formatting
+- Syntax colors automatically adapt to light/dark theme (using `base16-ocean.dark` for dark mode and `InspiredGitHub` for light mode)
+- Markdown files are handled separately by the rendered/WYSIWYG editor, so syntax highlighting only affects other file types in raw mode
 
-### Theme Color Extraction
+## Implementation Details
 
-```rust
-let highlighter = get_highlighter();
-let theme = highlighter.get_theme_for_mode(true); // dark mode
+### Files Modified
 
-// Get theme colors
-let bg = highlighter.get_theme_background(theme); // Option<Color32>
-let fg = highlighter.get_theme_foreground(theme); // Option<Color32>
-```
+| File | Changes |
+|------|---------|
+| `src/config/settings.rs` | Added `syntax_highlighting_enabled: bool` setting |
+| `src/ui/settings.rs` | Added checkbox in Editor section |
+| `src/markdown/syntax.rs` | Added `language_from_path()` and `can_highlight_file()` helpers |
+| `src/editor/widget.rs` | Modified layouter to use syntax highlighting |
+| `src/app.rs` | Passed syntax highlighting config to EditorWidget |
 
-## Performance Considerations
+### Key Components
 
-### Caching Strategy
+1. **Language Detection**: `language_from_path()` in `syntax.rs` maps file extensions to syntect language identifiers
 
-1. **Global SyntaxSet/ThemeSet**: Loaded once, reused for all operations
-2. **Lazy Initialization**: Sets only loaded on first use
-3. **OnceLock**: Thread-safe initialization without mutex overhead
+2. **Highlighter Integration**: The `EditorWidget` layouter creates a colored `LayoutJob` using `highlight_code()` when a language is detected
 
-### Optimization Tips
+3. **Theme Selection**: Dark mode uses `base16-ocean.dark`, light mode uses `InspiredGitHub`
 
-- The global highlighter instance avoids repeated loading (~10-20ms per load)
-- For large documents, consider caching highlighted output
-- Line-by-line highlighting (`highlight_line`) is more memory-efficient than whole-document
+### Performance Considerations
 
-## Color Conversion
-
-Syntect uses its own Color type; conversion to egui's Color32:
-
-```rust
-pub fn syntect_to_egui_color(color: syntect::highlighting::Color) -> Color32 {
-    Color32::from_rgba_unmultiplied(color.r, color.g, color.b, color.a)
-}
-```
-
-## Settings Integration
-
-The syntax theme can be configured in `Settings`:
-
-```rust
-// In src/config/settings.rs
-pub struct Settings {
-    /// Syntax highlighting theme name
-    pub syntax_theme: String,  // Default: "base16-ocean.dark"
-}
-```
-
-Usage with settings:
-
-```rust
-let highlighter = get_highlighter();
-let theme = highlighter.get_theme_by_name_or_mode(
-    &settings.syntax_theme,
-    dark_mode
-);
-```
+- **Caching**: Highlighted output is cached in egui's memory and only regenerated when content changes (detected via content hash). This makes static viewing essentially zero-cost.
+- The syntect `SyntaxSet` and `ThemeSet` are loaded once globally and reused
+- Cache is keyed by (editor_id, content_hash, language, dark_mode) for correctness
 
 ## Testing
 
-The module includes comprehensive tests:
+1. Open a `.rs`, `.py`, `.js`, or `.json` file
+2. Verify syntax colors appear (keywords, strings, comments should have distinct colors)
+3. Toggle setting off in Settings → Editor → Syntax Highlighting
+4. Colors should disappear (plain text)
+5. Switch between light/dark theme - colors should adapt
 
-```rust
-#[test]
-fn test_highlight_rust_code() {
-    let highlighter = SyntaxHighlighter::new();
-    let code = "fn main() {\n    println!(\"Hello\");\n}";
-    let lines = highlighter.highlight_code_for_mode(code, "rust", true);
-    
-    assert_eq!(lines.len(), 3);
-    assert!(!lines[0].segments.is_empty());
-}
+## Known Limitations
 
-#[test]
-fn test_language_aliases() {
-    let highlighter = SyntaxHighlighter::new();
-    let syntax1 = highlighter.find_syntax_for_language("rs");
-    let syntax2 = highlighter.find_syntax_for_language("rust");
-    
-    assert_eq!(syntax1.unwrap().name, syntax2.unwrap().name);
-}
-```
-
-## API Reference
-
-### Public Functions
-
-| Function | Description |
-|----------|-------------|
-| `get_highlighter()` | Get global highlighter instance |
-| `highlight_code(code, lang, dark)` | Highlight with auto theme |
-| `highlight_code_with_theme(code, lang, theme, dark)` | Highlight with specific theme |
-| `syntect_to_egui_color(color)` | Convert syntect Color to egui Color32 |
-
-### Public Types
-
-| Type | Description |
-|------|-------------|
-| `SyntaxHighlighter` | Main highlighter struct |
-| `HighlightedLine` | A line of highlighted segments |
-| `HighlightedSegment` | A segment with color and style |
-
-### Constants
-
-| Constant | Value | Description |
-|----------|-------|-------------|
-| `DEFAULT_DARK_THEME` | `"base16-ocean.dark"` | Default dark theme |
-| `DEFAULT_LIGHT_THEME` | `"InspiredGitHub"` | Default light theme |
-| `FALLBACK_THEME` | `"base16-ocean.dark"` | Fallback if theme not found |
+- Bold/italic font styles from syntect are not applied (egui TextFormat limitation)
+- No per-file-type theme customization (uses global dark/light themes)
+- Initial highlighting of very large files (>10,000 lines) may take a moment on first open

@@ -139,6 +139,12 @@ impl ThemeManager {
     pub fn apply(&mut self, ctx: &Context) {
         let visuals = self.get_or_create_visuals(ctx);
         ctx.set_visuals(visuals);
+        
+        // Set fast/snappy animations (default is ~83ms, we use 16ms for snappy feel)
+        let mut style = (*ctx.style()).clone();
+        style.animation_time = 0.016; // ~1 frame at 60fps - very snappy
+        ctx.set_style(style);
+        
         self.needs_apply = false;
         debug!("Applied theme: {:?}", self.current_theme);
     }

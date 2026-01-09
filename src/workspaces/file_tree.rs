@@ -200,12 +200,12 @@ impl FileTreeNode {
                     Some("css" | "scss" | "sass") => "🎨",
                     Some("json") => "📋",
                     Some("yaml" | "yml") => "📋",
-                    Some("toml") => "⚙️",
+                    Some("toml") => "🔧", // Use wrench instead of gear+variation selector
                     Some("xml") => "📰",
                     // Config files
-                    Some("gitignore" | "env") => "⚙️",
-                    // Images
-                    Some("png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "ico") => "🖼️",
+                    Some("gitignore" | "env") => "🔧", // Use wrench instead of gear+variation selector
+                    // Images - use camera instead of picture+variation selector
+                    Some("png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "ico") => "📷",
                     // Documents
                     Some("pdf") => "📕",
                     Some("doc" | "docx") => "📘",

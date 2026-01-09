@@ -54,6 +54,21 @@ A fast, lightweight text editor for Markdown, JSON, and more. Built with Rust an
 | [Window Resize](./technical/window-resize.md) | Custom resize handles for borderless windows, edge detection, cursor icons |
 | [Adaptive Toolbar](./technical/adaptive-toolbar.md) | File-type aware toolbar, conditional buttons for Markdown vs JSON/YAML/TOML |
 | [About/Help Panel](./technical/about-help.md) | About dialog with version info, Help panel with keyboard shortcuts reference |
+| [List Editing Fixes](./technical/list-editing-fixes.md) | Frontmatter offset fix, edit buffer persistence, deferred commits, rendered-mode undo/redo |
+| [Light Mode Contrast](./technical/light-mode-contrast.md) | WCAG AA color tokens, contrast ratios, border/text improvements |
+| [Multi-Cursor (Partial)](./technical/multi-cursor.md) | Selection/MultiCursor data structures, Ctrl+D next occurrence, Ctrl+Click add cursor (text ops deferred) |
+| [Session Persistence](./technical/session-persistence.md) | Crash-safe session state, tab restoration, recovery dialog, lock file mechanism |
+| [Git Integration](./technical/git-integration.md) | Branch display in status bar, file tree Git status badges, git2 integration |
+| [Zen Mode](./technical/zen-mode.md) | Distraction-free writing mode, centered text column, chrome hiding, F11 toggle |
+| [Search Highlight](./technical/search-highlight.md) | Search-in-files result navigation with transient highlight, auto Raw mode switch |
+| [Auto-Save](./technical/auto-save.md) | Configurable auto-save with temp file backups, toolbar toggle, recovery dialog |
+| [Code Folding](./technical/code-folding.md) | Fold region detection, gutter indicators (text hiding deferred to v0.3.0) |
+| [Split View](./technical/split-view.md) | Side-by-side raw editor + rendered preview, draggable splitter, independent scrolling |
+| [Live Pipeline](./technical/live-pipeline.md) | JSON/YAML command piping through shell commands (jq, yq), recent history, output display |
+| [Search Panel Viewport](./technical/search-panel-viewport.md) | Viewport constraints for Search panel, DPI handling, resize behavior |
+| [Ribbon Redesign](./technical/ribbon-redesign.md) | Design C streamlined ribbon, title bar integration, dropdown menus |
+| [Mermaid Diagrams](./technical/mermaid-diagrams.md) | MermaidJS code block detection, diagram type indicators, styled rendering |
+| [Editor Minimap](./technical/minimap.md) | VS Code-style minimap navigation, click-to-navigate, search highlights, split view support |
 | [Branding](./branding.md) | Icon design, asset generation, platform integration guidelines |
 
 ---
@@ -122,8 +137,13 @@ ferrite/
 │   │   ├── file_tree.rs  # File tree sidebar panel
 │   │   ├── quick_switcher.rs # Quick file switcher (Ctrl+P)
 │   │   ├── search.rs     # Search in files (Ctrl+Shift+F)
+│   │   ├── pipeline.rs   # Live Pipeline panel (JSON/YAML command piping)
 │   │   ├── dialogs.rs    # File operation dialogs
+│   │   ├── view_segment.rs # Title bar view mode segment, buttons
 │   │   └── window.rs     # Custom window resize for borderless windows
+│   ├── vcs/              # Version control integration
+│   │   ├── mod.rs        # Module exports
+│   │   └── git.rs        # GitService, status tracking (git2)
 │   └── workspaces/       # Workspace/folder management
 │       ├── mod.rs        # AppMode, Workspace, module exports
 │       ├── file_tree.rs  # FileTreeNode, directory scanning
@@ -165,6 +185,7 @@ ferrite/
 | Fuzzy Matching | fuzzy-matcher | 0.3 |
 | Icon Loading | image | 0.25 |
 | Windows Icon | embed-resource | 2.4 |
+| Git Integration | git2 | 0.19 |
 
 ---
 

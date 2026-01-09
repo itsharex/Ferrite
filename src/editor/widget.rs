@@ -5,17 +5,57 @@
 //! scrolling, and optional line numbers.
 
 use crate::config::EditorFont;
+use crate::editor::matching::DelimiterMatcher;
 use crate::fonts;
+use crate::markdown::syntax::{highlight_code, language_from_path, HighlightedLine};
 use crate::state::Tab;
 use crate::theme::ThemeColors;
 use eframe::egui::{self, FontId, ScrollArea, TextEdit, Ui};
 use log::debug;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 use std::sync::Arc;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Syntax Highlighting Cache
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Cached syntax highlighting entry.
+#[derive(Clone)]
+struct SyntaxCacheEntry {
+    /// Hash of the content that was highlighted
+    content_hash: u64,
+    /// Language used for highlighting
+    language: String,
+    /// Whether dark mode was active
+    is_dark: bool,
+    /// The highlighted lines
+    lines: Vec<HighlightedLine>,
+}
+
+/// Cached syntax highlighting data stored in egui's memory.
+#[derive(Clone, Default)]
+struct SyntaxHighlightCache {
+    /// Map from editor ID to cached entry
+    cache: HashMap<egui::Id, SyntaxCacheEntry>,
+}
+
+/// Compute a fast hash of a string for cache invalidation.
+fn compute_content_hash(s: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut hasher);
+    hasher.finish()
+}
 
 /// Result of showing the editor widget.
 pub struct EditorOutput {
     /// Whether the content was modified.
     pub changed: bool,
+    /// Whether Ctrl+Click was detected (for adding cursors).
+    pub ctrl_click_pos: Option<usize>,
+    /// Line where fold toggle was clicked (if any).
+    pub fold_toggle_line: Option<usize>,
 }
 
 /// Search match highlight information.
@@ -39,6 +79,9 @@ pub struct SearchHighlights {
 /// - Optional line number gutter
 /// - Search match highlighting
 /// - Scroll-to-line navigation (for outline panel)
+/// - Zen Mode centered text column
+/// - Bracket and emphasis matching highlights
+/// - Syntax highlighting for source code files
 ///
 /// # Example
 ///
@@ -48,6 +91,9 @@ pub struct SearchHighlights {
 ///     .show_line_numbers(true)
 ///     .search_highlights(highlights)
 ///     .scroll_to_line(Some(42))
+///     .zen_mode(true, 80.0)
+///     .highlight_matching_pairs(true)
+///     .syntax_highlighting(true, Some(path), is_dark)
 ///     .show(ui);
 /// ```
 pub struct EditorWidget<'a> {
@@ -71,6 +117,22 @@ pub struct EditorWidget<'a> {
     font_family: EditorFont,
     /// Line number to scroll to (1-indexed, from outline navigation).
     scroll_to_line: Option<usize>,
+    /// Whether Zen Mode is enabled (centered text column).
+    zen_mode: bool,
+    /// Maximum column width in characters for Zen Mode centering.
+    zen_max_column_width: f32,
+    /// Transient highlight for search result navigation (char range).
+    transient_highlight: Option<(usize, usize)>,
+    /// Whether to show fold indicators in the gutter.
+    show_fold_indicators: bool,
+    /// Whether to highlight matching bracket/emphasis pairs.
+    highlight_matching_pairs: bool,
+    /// Whether syntax highlighting is enabled.
+    syntax_highlighting: bool,
+    /// File path for syntax detection (needed for determining language).
+    file_path: Option<PathBuf>,
+    /// Whether we're in dark mode (for syntax theme selection).
+    is_dark_mode: bool,
 }
 
 impl<'a> EditorWidget<'a> {
@@ -87,6 +149,14 @@ impl<'a> EditorWidget<'a> {
             search_highlights: None,
             font_family: EditorFont::default(),
             scroll_to_line: None,
+            zen_mode: false,
+            zen_max_column_width: 80.0,
+            transient_highlight: None,
+            show_fold_indicators: true,
+            highlight_matching_pairs: true,
+            syntax_highlighting: false,
+            file_path: None,
+            is_dark_mode: true,
         }
     }
 
@@ -146,6 +216,67 @@ impl<'a> EditorWidget<'a> {
         self
     }
 
+    /// Enable Zen Mode with centered text column.
+    ///
+    /// When enabled, the text content is centered horizontally with a maximum
+    /// column width, while the editor background fills the available space.
+    #[must_use]
+    pub fn zen_mode(mut self, enabled: bool, max_column_width: f32) -> Self {
+        self.zen_mode = enabled;
+        self.zen_max_column_width = max_column_width;
+        self
+    }
+
+    /// Set a transient highlight for search result navigation.
+    ///
+    /// This is rendered as a distinct background highlight that is independent
+    /// of text selection. Used when navigating to search-in-files results.
+    #[must_use]
+    pub fn transient_highlight(mut self, range: Option<(usize, usize)>) -> Self {
+        self.transient_highlight = range;
+        self
+    }
+
+    /// Set whether to show fold indicators in the gutter.
+    #[must_use]
+    pub fn show_fold_indicators(mut self, show: bool) -> Self {
+        self.show_fold_indicators = show;
+        self
+    }
+
+    /// Set whether to highlight matching bracket/emphasis pairs.
+    ///
+    /// When enabled, positions the cursor adjacent to a bracket like `(`, `[`, `{`, `<`
+    /// or their closing counterparts, or markdown emphasis markers `**` and `__`,
+    /// will highlight both the delimiter and its matching counterpart.
+    #[must_use]
+    pub fn highlight_matching_pairs(mut self, enabled: bool) -> Self {
+        self.highlight_matching_pairs = enabled;
+        self
+    }
+
+    /// Enable syntax highlighting for source code files.
+    ///
+    /// When enabled and the file has a recognized extension (Rust, Python, JS, etc.),
+    /// the editor will apply syntax-aware coloring to the text.
+    ///
+    /// # Arguments
+    /// * `enabled` - Whether syntax highlighting is enabled
+    /// * `file_path` - Optional file path for language detection
+    /// * `is_dark` - Whether to use dark mode syntax colors
+    #[must_use]
+    pub fn syntax_highlighting(
+        mut self,
+        enabled: bool,
+        file_path: Option<PathBuf>,
+        is_dark: bool,
+    ) -> Self {
+        self.syntax_highlighting = enabled;
+        self.file_path = file_path;
+        self.is_dark_mode = is_dark;
+        self
+    }
+
     /// Show the editor widget and return the output.
     pub fn show(self, ui: &mut Ui) -> EditorOutput {
         // Include content_version in the ID so that egui treats the TextEdit as
@@ -167,10 +298,24 @@ impl<'a> EditorWidget<'a> {
         let font_size = self.font_size;
         let word_wrap = self.word_wrap;
         let show_line_numbers = self.show_line_numbers;
+        let show_fold_indicators = self.show_fold_indicators;
         let theme_colors = self.theme_colors.clone();
         let search_highlights = self.search_highlights.clone();
+        let transient_highlight = self.transient_highlight;
+        let highlight_matching_pairs = self.highlight_matching_pairs;
+
+        // Get fold indicator lines if folding is enabled
+        let fold_indicators: Vec<(usize, bool)> = if show_fold_indicators {
+            self.tab.fold_indicator_lines()
+        } else {
+            Vec::new()
+        };
+        let has_folds = !fold_indicators.is_empty();
+        
 
         // Calculate gutter width if line numbers are enabled
+        // Add extra space for fold indicators if there are folds
+        let fold_indicator_width = if show_fold_indicators && has_folds { 16.0 } else { 0.0 };
         let gutter_width = if show_line_numbers {
             let line_count = super::line_numbers::count_lines(&self.tab.content);
             let digit_count = if line_count == 0 {
@@ -180,7 +325,9 @@ impl<'a> EditorWidget<'a> {
             };
             let char_width = font_size * 0.6;
             let content_width = char_width * digit_count as f32;
-            (content_width + 20.0).max(30.0) // padding + min width
+            (content_width + 20.0 + fold_indicator_width).max(30.0 + fold_indicator_width)
+        } else if show_fold_indicators && has_folds {
+            fold_indicator_width + 4.0 // Just fold indicators, small padding
         } else {
             0.0
         };
@@ -191,23 +338,111 @@ impl<'a> EditorWidget<'a> {
         // Get font family for the editor
         let font_family = fonts::get_styled_font_family(false, false, self.font_family);
 
+        // Determine syntax language from file path (if syntax highlighting is enabled)
+        let syntax_language = if self.syntax_highlighting {
+            self.file_path
+                .as_ref()
+                .and_then(|p| language_from_path(p))
+        } else {
+            None
+        };
+        let is_dark_mode = self.is_dark_mode;
+
+        // Get cached highlights if available (we'll verify freshness in the layouter)
+        let cached_entry: Option<SyntaxCacheEntry> = if syntax_language.is_some() {
+            ui.ctx().data_mut(|data| {
+                let cache = data.get_temp_mut_or_default::<SyntaxHighlightCache>(egui::Id::NULL);
+                cache.cache.get(&id).cloned()
+            })
+        } else {
+            None
+        };
+
+        // Clone what we need for the layouter closure
+        let syntax_lang_for_layouter = syntax_language.clone();
+        let ctx_clone = ui.ctx().clone();
+
         // Configure the text layout based on word wrap
         let font_family_clone = font_family.clone();
         let mut layouter = move |ui: &Ui, text: &str, wrap_width: f32| -> Arc<egui::Galley> {
             let font_id = FontId::new(font_size, font_family_clone.clone());
-            let layout_job = if word_wrap {
-                egui::text::LayoutJob::simple(
-                    text.to_owned(),
-                    font_id,
-                    ui.visuals().text_color(),
-                    wrap_width,
-                )
+
+            // Use syntax highlighting if we have a recognized language
+            let layout_job = if let Some(ref lang) = syntax_lang_for_layouter {
+                // Compute hash of the actual text being laid out
+                let text_hash = compute_content_hash(text);
+
+                // Check if cached entry is still valid for this exact text
+                let use_cached = cached_entry.as_ref().map_or(false, |entry| {
+                    entry.content_hash == text_hash
+                        && entry.language == *lang
+                        && entry.is_dark == is_dark_mode
+                });
+
+                let highlighted_lines = if use_cached {
+                    // Cache hit - use cached result
+                    cached_entry.as_ref().unwrap().lines.clone()
+                } else {
+                    // Cache miss - regenerate and update cache
+                    debug!("Syntax highlighting: cache miss, regenerating");
+                    let lines = highlight_code(text, lang, is_dark_mode);
+
+                    // Store in cache for next frame
+                    ctx_clone.data_mut(|data| {
+                        let cache = data.get_temp_mut_or_default::<SyntaxHighlightCache>(egui::Id::NULL);
+                        cache.cache.insert(
+                            id,
+                            SyntaxCacheEntry {
+                                content_hash: text_hash,
+                                language: lang.clone(),
+                                is_dark: is_dark_mode,
+                                lines: lines.clone(),
+                            },
+                        );
+                    });
+
+                    lines
+                };
+
+                // Create a syntax-highlighted layout job
+                let mut job = egui::text::LayoutJob::default();
+                job.wrap.max_width = if word_wrap { wrap_width } else { f32::INFINITY };
+
+                // Build the layout job from highlighted segments
+                for line in &highlighted_lines {
+                    for segment in &line.segments {
+                        let mut format = egui::text::TextFormat::default();
+                        format.font_id = font_id.clone();
+                        format.color = segment.foreground;
+                        job.append(&segment.text, 0.0, format);
+                    }
+                }
+
+                // Handle empty text case
+                if text.is_empty() {
+                    let mut format = egui::text::TextFormat::default();
+                    format.font_id = font_id;
+                    format.color = ui.visuals().text_color();
+                    job.append("", 0.0, format);
+                }
+
+                job
             } else {
-                egui::text::LayoutJob::simple_singleline(
-                    text.to_owned(),
-                    font_id,
-                    ui.visuals().text_color(),
-                )
+                // No syntax highlighting - use simple layout
+                if word_wrap {
+                    egui::text::LayoutJob::simple(
+                        text.to_owned(),
+                        font_id,
+                        ui.visuals().text_color(),
+                        wrap_width,
+                    )
+                } else {
+                    egui::text::LayoutJob::simple_singleline(
+                        text.to_owned(),
+                        font_id,
+                        ui.visuals().text_color(),
+                    )
+                }
             };
             ui.fonts(|f| f.layout_job(layout_job))
         };
@@ -247,36 +482,71 @@ impl<'a> EditorWidget<'a> {
             .id_source(id.with("scroll"))
             .auto_shrink([false, false]);
 
-        // Apply scroll offset if we need to jump to a match
-        if let Some(offset) = target_scroll_offset {
+        // Priority: Apply pending scroll offset from mode switch first
+        if let Some(offset) = self.tab.pending_scroll_offset.take() {
+            scroll_area = scroll_area.vertical_scroll_offset(offset);
+            debug!("Applied pending scroll offset: {}", offset);
+        }
+        // Otherwise, apply scroll offset if we need to jump to a match or line
+        else if let Some(offset) = target_scroll_offset {
             scroll_area = scroll_area.vertical_scroll_offset(offset);
         }
 
+        // Calculate Zen Mode centering margin
+        let zen_margin = if self.zen_mode {
+            let char_width = font_size * 0.6; // Approximate average character width
+            let max_content_width = char_width * self.zen_max_column_width;
+            let available = ui.available_width();
+            
+            if available > max_content_width {
+                (available - max_content_width) / 2.0
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+        
         let scroll_output = scroll_area.show(ui, |ui| {
             // Use horizontal layout inside ScrollArea so gutter and editor scroll together
             ui.horizontal_top(|ui| {
+                // Add left margin for Zen Mode centering
+                if zen_margin > 0.0 {
+                    ui.add_space(zen_margin);
+                }
+                
                 // Reserve space for the gutter (will be drawn after we know text positions)
-                let gutter_rect = if show_line_numbers {
+                // Create gutter if we have line numbers OR fold indicators
+                let gutter_rect = if show_line_numbers || (show_fold_indicators && has_folds) {
                     let line_count = super::line_numbers::count_lines(content);
                     let line_height =
                         ui.fonts(|f| f.row_height(&FontId::new(font_size, font_family.clone())));
                     let total_height = line_count as f32 * line_height;
 
-                    let (rect, _) = ui.allocate_exact_size(
+                    // Use Sense::click() so we can detect fold indicator clicks
+                    let (rect, response) = ui.allocate_exact_size(
                         egui::vec2(gutter_width, total_height.max(ui.available_height())),
-                        egui::Sense::hover(),
+                        egui::Sense::click(),
                     );
-                    Some(rect)
+                    Some((rect, response))
                 } else {
                     None
                 };
 
                 // Create the multiline text editor
+                // In Zen Mode, constrain width to max column width
+                let desired_width = if self.zen_mode && zen_margin > 0.0 {
+                    let char_width = font_size * 0.6;
+                    char_width * self.zen_max_column_width
+                } else {
+                    f32::INFINITY
+                };
+                
                 let text_edit = TextEdit::multiline(content)
                     .id(id)
                     .frame(self.frame)
                     .font(FontId::new(font_size, font_family.clone()))
-                    .desired_width(f32::INFINITY)
+                    .desired_width(desired_width)
                     .layouter(&mut layouter);
 
                 // Show the editor and get the output
@@ -383,12 +653,217 @@ impl<'a> EditorWidget<'a> {
                     }
                 }
 
-                // Now draw line numbers using the actual galley positions
-                if let Some(gutter_rect) = gutter_rect {
+                // Draw transient highlight for search result navigation
+                if let Some((hl_start, hl_end)) = transient_highlight {
+                    let galley = &text_output.galley;
+                    let galley_pos = text_output.galley_pos;
+                    let painter = ui.painter();
+                    let is_dark = theme_colors.as_ref().map(|c| c.is_dark()).unwrap_or(false);
+
+                    // Distinct color for transient highlight - soft orange/amber
+                    let highlight_color = if is_dark {
+                        egui::Color32::from_rgba_unmultiplied(255, 165, 50, 120) // Amber
+                    } else {
+                        egui::Color32::from_rgba_unmultiplied(255, 180, 80, 150) // Light orange
+                    };
+
+                    // Get rectangles for the highlight range from the galley
+                    let cursor_start = egui::text::CCursor::new(hl_start);
+                    let cursor_end = egui::text::CCursor::new(hl_end);
+
+                    let start_cursor = galley.from_ccursor(cursor_start);
+                    let end_cursor = galley.from_ccursor(cursor_end);
+                    let start_rcursor = start_cursor.rcursor;
+                    let end_rcursor = end_cursor.rcursor;
+
+                    // Handle single-row or multi-row highlights
+                    if start_rcursor.row == end_rcursor.row {
+                        // Single row - draw one rectangle
+                        if let Some(row) = galley.rows.get(start_rcursor.row) {
+                            let row_rect = row.rect;
+                            let x_start = row.x_offset(start_rcursor.column);
+                            let x_end = row.x_offset(end_rcursor.column);
+
+                            let highlight_rect = egui::Rect::from_min_max(
+                                egui::pos2(
+                                    galley_pos.x + x_start,
+                                    galley_pos.y + row_rect.min.y,
+                                ),
+                                egui::pos2(
+                                    galley_pos.x + x_end,
+                                    galley_pos.y + row_rect.max.y,
+                                ),
+                            );
+                            painter.rect_filled(highlight_rect, 2.0, highlight_color);
+                        }
+                    } else {
+                        // Multi-row highlight
+                        for row_idx in start_rcursor.row..=end_rcursor.row {
+                            if let Some(row) = galley.rows.get(row_idx) {
+                                let row_rect = row.rect;
+
+                                let x_start = if row_idx == start_rcursor.row {
+                                    row.x_offset(start_rcursor.column)
+                                } else {
+                                    0.0
+                                };
+
+                                let x_end = if row_idx == end_rcursor.row {
+                                    row.x_offset(end_rcursor.column)
+                                } else {
+                                    row_rect.width()
+                                };
+
+                                let highlight_rect = egui::Rect::from_min_max(
+                                    egui::pos2(
+                                        galley_pos.x + x_start,
+                                        galley_pos.y + row_rect.min.y,
+                                    ),
+                                    egui::pos2(
+                                        galley_pos.x + x_end,
+                                        galley_pos.y + row_rect.max.y,
+                                    ),
+                                );
+                                painter.rect_filled(highlight_rect, 2.0, highlight_color);
+                            }
+                        }
+                    }
+                }
+
+                // Draw bracket/emphasis matching highlights
+                if highlight_matching_pairs {
+                    // Get the primary cursor position (in character units)
+                    let primary_cursor_pos = self.tab.cursors.primary().head;
+                    // Convert to byte position for the delimiter matcher
+                    let cursor_byte_pos = char_to_byte_pos(content, primary_cursor_pos);
+                    
+                    // Find matching delimiter pair
+                    let matcher = DelimiterMatcher::new(content);
+                    if let Some(matching_pair) = matcher.find_match(cursor_byte_pos) {
+                        let galley = &text_output.galley;
+                        let galley_pos = text_output.galley_pos;
+                        let painter = ui.painter();
+                        
+                        // Get theme-aware colors for bracket matching
+                        let (bg_color, border_color) = theme_colors
+                            .as_ref()
+                            .map(|c| (c.ui.matching_bracket_bg, c.ui.matching_bracket_border))
+                            .unwrap_or_else(|| {
+                                // Fallback colors if no theme is set
+                                let is_dark = ui.visuals().dark_mode;
+                                if is_dark {
+                                    (
+                                        egui::Color32::from_rgba_unmultiplied(80, 180, 220, 60),
+                                        egui::Color32::from_rgb(100, 180, 220),
+                                    )
+                                } else {
+                                    (
+                                        egui::Color32::from_rgba_unmultiplied(255, 220, 100, 80),
+                                        egui::Color32::from_rgb(200, 170, 50),
+                                    )
+                                }
+                            });
+                        
+                        // Draw highlights for both source and target delimiters
+                        for token in [&matching_pair.source, &matching_pair.target] {
+                            // Convert byte positions to character positions for galley
+                            let char_start = byte_to_char_pos(content, token.start);
+                            let char_end = byte_to_char_pos(content, token.end);
+                            
+                            let cursor_start = egui::text::CCursor::new(char_start);
+                            let cursor_end = egui::text::CCursor::new(char_end);
+                            
+                            let start_cursor = galley.from_ccursor(cursor_start);
+                            let end_cursor = galley.from_ccursor(cursor_end);
+                            let start_rcursor = start_cursor.rcursor;
+                            let end_rcursor = end_cursor.rcursor;
+                            
+                            // Single row highlight (brackets are typically on one row)
+                            if start_rcursor.row == end_rcursor.row {
+                                if let Some(row) = galley.rows.get(start_rcursor.row) {
+                                    let row_rect = row.rect;
+                                    let x_start = row.x_offset(start_rcursor.column);
+                                    let x_end = row.x_offset(end_rcursor.column);
+                                    
+                                    let highlight_rect = egui::Rect::from_min_max(
+                                        egui::pos2(
+                                            galley_pos.x + x_start,
+                                            galley_pos.y + row_rect.min.y,
+                                        ),
+                                        egui::pos2(
+                                            galley_pos.x + x_end,
+                                            galley_pos.y + row_rect.max.y,
+                                        ),
+                                    );
+                                    
+                                    // Draw background fill
+                                    painter.rect_filled(highlight_rect, 2.0, bg_color);
+                                    // Draw border for better visibility
+                                    painter.rect_stroke(
+                                        highlight_rect,
+                                        2.0,
+                                        egui::Stroke::new(1.0, border_color),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Draw multi-cursor highlights and carets (for additional cursors beyond primary)
+                if !self.tab.cursors.is_single() {
+                    let galley = &text_output.galley;
+                    let galley_pos = text_output.galley_pos;
+                    let painter = ui.painter();
+                    let is_dark = theme_colors.as_ref().map(|c| c.is_dark()).unwrap_or(false);
+                    let primary_idx = self.tab.cursors.primary_index();
+
+                    // Multi-cursor colors
+                    let cursor_color = if is_dark {
+                        egui::Color32::from_rgba_unmultiplied(100, 180, 255, 255) // Light blue cursor
+                    } else {
+                        egui::Color32::from_rgba_unmultiplied(0, 100, 200, 255) // Dark blue cursor
+                    };
+                    let selection_color = if is_dark {
+                        egui::Color32::from_rgba_unmultiplied(100, 180, 255, 60) // Light blue selection
+                    } else {
+                        egui::Color32::from_rgba_unmultiplied(0, 100, 200, 50) // Dark blue selection
+                    };
+
+                    for (idx, sel) in self.tab.cursors.selections().iter().enumerate() {
+                        // Skip primary cursor (it's handled by egui's TextEdit)
+                        if idx == primary_idx {
+                            continue;
+                        }
+
+                        // Draw selection highlight if there's a selection
+                        if sel.is_selection() {
+                            let (start, end) = sel.range();
+                            draw_selection_highlight(
+                                painter,
+                                galley,
+                                galley_pos,
+                                start,
+                                end,
+                                selection_color,
+                            );
+                        }
+
+                        // Draw cursor caret
+                        draw_cursor_caret(painter, galley, galley_pos, sel.head, cursor_color);
+                    }
+                }
+
+                // Track fold toggle clicks
+                let mut fold_toggle_line: Option<usize> = None;
+
+                // Now draw line numbers and fold indicators using the actual galley positions
+                if let Some((gutter_rect, gutter_response)) = gutter_rect {
                     let galley = &text_output.galley;
                     let galley_pos = text_output.galley_pos;
 
                     // Get colors for styling
+                    let is_dark = theme_colors.as_ref().map(|c| c.is_dark()).unwrap_or(false);
                     let line_color = theme_colors
                         .as_ref()
                         .map(|c| c.text.muted)
@@ -401,6 +876,18 @@ impl<'a> EditorWidget<'a> {
                         .as_ref()
                         .map(|c| c.base.border_subtle)
                         .unwrap_or(egui::Color32::from_rgb(200, 200, 200));
+                    
+                    // Fold indicator colors
+                    let fold_color = if is_dark {
+                        egui::Color32::from_rgb(140, 140, 140)
+                    } else {
+                        egui::Color32::from_rgb(100, 100, 100)
+                    };
+                    let fold_hover_color = if is_dark {
+                        egui::Color32::from_rgb(180, 180, 180)
+                    } else {
+                        egui::Color32::from_rgb(60, 60, 60)
+                    };
 
                     let painter = ui.painter();
 
@@ -419,6 +906,10 @@ impl<'a> EditorWidget<'a> {
                     // Draw line numbers aligned with actual galley rows
                     // Always use monospace font for line numbers for proper alignment
                     let line_number_font_id = FontId::monospace(font_size);
+                    let line_height = ui.fonts(|f| f.row_height(&line_number_font_id));
+
+                    // Build a map of logical_line -> (row_y, row_height) for fold indicators
+                    let mut line_y_map: std::collections::HashMap<usize, (f32, f32)> = std::collections::HashMap::new();
 
                     // Track logical line number
                     // With word wrap, multiple rows can belong to the same logical line
@@ -429,26 +920,36 @@ impl<'a> EditorWidget<'a> {
                     for row in galley.rows.iter() {
                         // Get the absolute Y position of this row (screen coordinates)
                         let row_y = galley_pos.y + row.min_y();
+                        let row_height = row.rect.height();
 
                         // Draw line number only once per logical line (at the first row of a wrapped line)
                         if !line_number_drawn_for_line {
                             let display_num = logical_line + 1; // 1-indexed
 
+                            // Record Y position for fold indicators
+                            line_y_map.insert(logical_line, (row_y, row_height));
+
                             // Position line number at EXACT same Y as the text row
                             // Use absolute row_y to ensure perfect alignment regardless of
                             // any offset between gutter_rect and galley_pos
-                            let text_pos = egui::pos2(
-                                gutter_rect.right() - 12.0, // Right padding
-                                row_y,                      // Absolute Y position from galley row
-                            );
+                            if show_line_numbers {
+                                // Offset line numbers to make room for fold indicators
+                                let line_num_x = if show_fold_indicators && has_folds {
+                                    gutter_rect.right() - 12.0 // Right padding after fold indicator space
+                                } else {
+                                    gutter_rect.right() - 12.0 // Right padding
+                                };
+                                
+                                let text_pos = egui::pos2(line_num_x, row_y);
 
-                            painter.text(
-                                text_pos,
-                                egui::Align2::RIGHT_TOP,
-                                format!("{}", display_num),
-                                line_number_font_id.clone(),
-                                line_color,
-                            );
+                                painter.text(
+                                    text_pos,
+                                    egui::Align2::RIGHT_TOP,
+                                    format!("{}", display_num),
+                                    line_number_font_id.clone(),
+                                    line_color,
+                                );
+                            }
 
                             line_number_drawn_for_line = true;
                         }
@@ -461,7 +962,7 @@ impl<'a> EditorWidget<'a> {
                     }
 
                     // Handle empty content (no rows in galley)
-                    if galley.rows.is_empty() {
+                    if galley.rows.is_empty() && show_line_numbers {
                         let text_pos = egui::pos2(
                             gutter_rect.right() - 12.0,
                             galley_pos.y, // Use galley position for empty content
@@ -470,65 +971,181 @@ impl<'a> EditorWidget<'a> {
                             text_pos,
                             egui::Align2::RIGHT_TOP,
                             "1",
-                            line_number_font_id,
+                            line_number_font_id.clone(),
                             line_color,
                         );
+                        line_y_map.insert(0, (galley_pos.y, line_height));
+                    }
+
+                    // Draw fold indicators
+                    if show_fold_indicators && has_folds {
+                        let fold_x = gutter_rect.left() + 4.0; // Left padding for fold indicators
+                        let indicator_size = (font_size * 0.6).min(12.0);
+                        
+                        // Check for hover position
+                        let hover_pos = ui.input(|i| i.pointer.hover_pos());
+                        let click_pos = if gutter_response.clicked() {
+                            ui.input(|i| i.pointer.interact_pos())
+                        } else {
+                            None
+                        };
+
+                        for (line, is_collapsed) in &fold_indicators {
+                            if let Some(&(row_y, row_height)) = line_y_map.get(line) {
+                                // Calculate indicator position centered vertically in the row
+                                let indicator_y = row_y + (row_height - indicator_size) / 2.0;
+                                let indicator_rect = egui::Rect::from_min_size(
+                                    egui::pos2(fold_x, indicator_y),
+                                    egui::vec2(indicator_size, indicator_size),
+                                );
+
+                                // Check if mouse is hovering over this indicator
+                                let is_hovered = hover_pos
+                                    .map(|pos| indicator_rect.expand(2.0).contains(pos))
+                                    .unwrap_or(false);
+
+                                // Check if this indicator was clicked
+                                if let Some(click) = click_pos {
+                                    if indicator_rect.expand(4.0).contains(click) {
+                                        fold_toggle_line = Some(*line);
+                                    }
+                                }
+
+                                let color = if is_hovered { fold_hover_color } else { fold_color };
+
+                                // Draw the fold indicator (triangle)
+                                if *is_collapsed {
+                                    // Collapsed: right-pointing triangle ▶ with highlight color
+                                    let collapsed_color = egui::Color32::from_rgb(255, 165, 0); // Orange for collapsed
+                                    let center = indicator_rect.center();
+                                    let half = indicator_size / 2.0 * 0.8;
+                                    let points = vec![
+                                        egui::pos2(center.x - half * 0.4, center.y - half),
+                                        egui::pos2(center.x + half * 0.8, center.y),
+                                        egui::pos2(center.x - half * 0.4, center.y + half),
+                                    ];
+                                    painter.add(egui::Shape::convex_polygon(
+                                        points,
+                                        if is_hovered { fold_hover_color } else { collapsed_color },
+                                        egui::Stroke::NONE,
+                                    ));
+                                } else {
+                                    // Expanded: down-pointing triangle ▼
+                                    let center = indicator_rect.center();
+                                    let half = indicator_size / 2.0 * 0.8;
+                                    let points = vec![
+                                        egui::pos2(center.x - half, center.y - half * 0.4),
+                                        egui::pos2(center.x + half, center.y - half * 0.4),
+                                        egui::pos2(center.x, center.y + half * 0.8),
+                                    ];
+                                    painter.add(egui::Shape::convex_polygon(
+                                        points,
+                                        color,
+                                        egui::Stroke::NONE,
+                                    ));
+                                }
+
+                                // Show cursor hint on hover
+                                if is_hovered {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                }
+                            }
+                        }
                     }
                 }
 
-                text_output
+                (text_output, fold_toggle_line)
             })
             .inner
         });
 
-        let text_output = scroll_output.inner;
+        let (text_output, fold_toggle_line) = scroll_output.inner;
         let cursor_range_opt = text_output.cursor_range;
 
         // Determine if content changed
         let changed = self.tab.content != original_content;
 
-        // If content changed, record for undo tracking
+        // If content changed, record for undo tracking and auto-save
         if changed {
             // TextEdit modifies content directly, so we need to manually
             // record the edit for undo/redo functionality
             self.tab.record_edit(original_content);
+            // Mark content as edited for auto-save scheduling
+            self.tab.mark_content_edited();
             debug!("Editor content changed, recorded for undo");
         }
 
-        // Calculate cursor position (line, column) and selection from cursor range
-        let (cursor_position, selection) = if let Some(cursor_range) = cursor_range_opt {
+        // Detect Ctrl+Click for multi-cursor support
+        let ctrl_click_pos = ui.input(|i| {
+            // Check if Ctrl is held and there was a primary click
+            if i.modifiers.ctrl && i.pointer.primary_clicked() {
+                // Get the new cursor position from the cursor range
+                cursor_range_opt.map(|cr| cr.primary.ccursor.index)
+            } else {
+                None
+            }
+        });
+
+        // Update cursor state from egui's TextEdit cursor range
+        if let Some(cursor_range) = cursor_range_opt {
             let primary = cursor_range.primary.ccursor.index;
             let secondary = cursor_range.secondary.ccursor.index;
 
-            // Convert character index to (line, column)
-            let pos = char_index_to_line_col(&self.tab.content, primary);
+            // For Ctrl+Click, don't update via egui - we'll handle it separately
+            if ctrl_click_pos.is_none() {
+                // Update multi-cursor state (also syncs legacy cursor_position and selection)
+                self.tab.update_cursor_from_egui(primary, secondary);
+            }
+        }
 
-            // Check if there's a selection (primary != secondary)
-            let sel = if primary != secondary {
-                let (start, end) = if primary < secondary {
-                    (primary, secondary)
-                } else {
-                    (secondary, primary)
-                };
-                Some((start, end))
-            } else {
-                None
-            };
-
-            (pos, sel)
-        } else {
-            (self.tab.cursor_position, self.tab.selection)
-        };
-
-        // Update tab's cursor position and selection
-        self.tab.cursor_position = cursor_position;
-        self.tab.selection = selection;
-
-        // Update scroll offset from ScrollArea state
+        // Update scroll metrics from ScrollArea state
         self.tab.scroll_offset = scroll_output.state.offset.y;
+        self.tab.content_height = scroll_output.content_size.y;
+        self.tab.viewport_height = scroll_output.inner_rect.height();
 
-        EditorOutput { changed }
+        // Update line height for accurate scroll sync
+        self.tab.raw_line_height = ui.fonts(|f| f.row_height(&FontId::new(font_size, font_family)));
+
+        // Handle pending scroll ratio: convert to offset now that we have content_height
+        if let Some(ratio) = self.tab.pending_scroll_ratio.take() {
+            let max_scroll = (scroll_output.content_size.y - scroll_output.inner_rect.height()).max(0.0);
+            if max_scroll > 0.0 {
+                let target_offset = ratio * max_scroll;
+                self.tab.pending_scroll_offset = Some(target_offset);
+                debug!(
+                    "Converted scroll ratio {:.3} to offset {:.1} in raw editor",
+                    ratio, target_offset
+                );
+                // Request repaint to apply the offset on next frame
+                ui.ctx().request_repaint();
+            }
+        }
+
+        EditorOutput {
+            changed,
+            ctrl_click_pos,
+            fold_toggle_line,
+        }
     }
+}
+
+/// Convert a byte position to a character position.
+///
+/// This is needed because the galley uses character indices while
+/// the delimiter matcher uses byte indices.
+fn byte_to_char_pos(text: &str, byte_pos: usize) -> usize {
+    text[..byte_pos.min(text.len())].chars().count()
+}
+
+/// Convert a character position to a byte position.
+///
+/// This is needed because cursor positions are in character units while
+/// the delimiter matcher uses byte indices.
+fn char_to_byte_pos(text: &str, char_pos: usize) -> usize {
+    text.char_indices()
+        .nth(char_pos)
+        .map(|(byte_idx, _)| byte_idx)
+        .unwrap_or(text.len())
 }
 
 /// Convert a character index to (line, column) position.
@@ -580,6 +1197,92 @@ fn line_col_to_char_index(text: &str, line: usize, col: usize) -> usize {
 
     // Return end of text if position is beyond
     text.chars().count()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Multi-Cursor Rendering Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Draw a selection highlight for a multi-cursor selection.
+fn draw_selection_highlight(
+    painter: &egui::Painter,
+    galley: &Arc<egui::Galley>,
+    galley_pos: egui::Pos2,
+    start: usize,
+    end: usize,
+    color: egui::Color32,
+) {
+    let cursor_start = egui::text::CCursor::new(start);
+    let cursor_end = egui::text::CCursor::new(end);
+
+    let start_cursor = galley.from_ccursor(cursor_start);
+    let end_cursor = galley.from_ccursor(cursor_end);
+    let start_rcursor = start_cursor.rcursor;
+    let end_rcursor = end_cursor.rcursor;
+
+    if start_rcursor.row == end_rcursor.row {
+        // Single row selection
+        if let Some(row) = galley.rows.get(start_rcursor.row) {
+            let row_rect = row.rect;
+            let x_start = row.x_offset(start_rcursor.column);
+            let x_end = row.x_offset(end_rcursor.column);
+
+            let highlight_rect = egui::Rect::from_min_max(
+                egui::pos2(galley_pos.x + x_start, galley_pos.y + row_rect.min.y),
+                egui::pos2(galley_pos.x + x_end, galley_pos.y + row_rect.max.y),
+            );
+            painter.rect_filled(highlight_rect, 2.0, color);
+        }
+    } else {
+        // Multi-row selection
+        for row_idx in start_rcursor.row..=end_rcursor.row {
+            if let Some(row) = galley.rows.get(row_idx) {
+                let row_rect = row.rect;
+
+                let x_start = if row_idx == start_rcursor.row {
+                    row.x_offset(start_rcursor.column)
+                } else {
+                    0.0
+                };
+
+                let x_end = if row_idx == end_rcursor.row {
+                    row.x_offset(end_rcursor.column)
+                } else {
+                    row_rect.width()
+                };
+
+                let highlight_rect = egui::Rect::from_min_max(
+                    egui::pos2(galley_pos.x + x_start, galley_pos.y + row_rect.min.y),
+                    egui::pos2(galley_pos.x + x_end, galley_pos.y + row_rect.max.y),
+                );
+                painter.rect_filled(highlight_rect, 2.0, color);
+            }
+        }
+    }
+}
+
+/// Draw a cursor caret at the given position.
+fn draw_cursor_caret(
+    painter: &egui::Painter,
+    galley: &Arc<egui::Galley>,
+    galley_pos: egui::Pos2,
+    pos: usize,
+    color: egui::Color32,
+) {
+    let cursor = galley.from_ccursor(egui::text::CCursor::new(pos));
+    let rcursor = cursor.rcursor;
+
+    if let Some(row) = galley.rows.get(rcursor.row) {
+        let row_rect = row.rect;
+        let x = row.x_offset(rcursor.column);
+
+        // Draw a thin vertical line for the cursor
+        let caret_rect = egui::Rect::from_min_max(
+            egui::pos2(galley_pos.x + x - 1.0, galley_pos.y + row_rect.min.y),
+            egui::pos2(galley_pos.x + x + 1.0, galley_pos.y + row_rect.max.y),
+        );
+        painter.rect_filled(caret_rect, 0.5, color);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

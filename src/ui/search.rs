@@ -1,12 +1,23 @@
 //! Search-in-files panel for workspace mode.
 //!
 //! Provides Ctrl+Shift+F search functionality across all files in the workspace.
+//!
+//! ## Viewport Constraints
+//!
+//! The search panel implements robust viewport constraints to ensure it always
+//! renders fully within the main application window. It:
+//!
+//! - Calculates safe bounds based on the current window client area
+//! - Respects minimum/maximum size limits while enabling internal scrolling
+//! - Automatically repositions when the window is resized
+//! - Works correctly with Split View and other layout modes
 
 // Allow dead code - includes ID counter and layout helpers for future search UI features
 #![allow(dead_code)]
 
 use crate::string_utils::floor_char_boundary;
-use eframe::egui::{self, Color32, Key, RichText, ScrollArea, Sense, TextFormat};
+use crate::ui::{center_panel_in_viewport, search_panel_constraints, PanelConstraints};
+use eframe::egui::{self, Color32, Key, Pos2, Rect, RichText, ScrollArea, Sense, TextFormat, Vec2};
 use std::path::PathBuf;
 
 /// Maximum number of results to show per file.
@@ -26,6 +37,10 @@ pub struct SearchMatch {
     pub match_start: usize,
     /// End position of match in line
     pub match_end: usize,
+    /// Absolute character offset from start of document
+    pub char_offset: usize,
+    /// Length of match in characters
+    pub match_len: usize,
 }
 
 /// Results for a single file.
@@ -41,11 +56,24 @@ pub struct FileSearchResults {
     pub expanded: bool,
 }
 
+/// Navigation target from a search result click.
+#[derive(Debug, Clone)]
+pub struct SearchNavigationTarget {
+    /// Path to the file containing the match
+    pub path: PathBuf,
+    /// The line number (1-indexed)
+    pub line_number: usize,
+    /// Absolute character offset from start of document
+    pub char_offset: usize,
+    /// Length of match in characters
+    pub match_len: usize,
+}
+
 /// Output from the search panel.
 #[derive(Debug, Default)]
 pub struct SearchPanelOutput {
-    /// File+line to navigate to (user clicked a result)
-    pub navigate_to: Option<(PathBuf, usize)>,
+    /// Navigation target (user clicked a result)
+    pub navigate_to: Option<SearchNavigationTarget>,
     /// Whether the panel was closed
     pub closed: bool,
     /// Whether search should be triggered
@@ -72,6 +100,14 @@ pub struct SearchPanel {
     error_message: Option<String>,
     /// Counter for unique IDs
     id_counter: usize,
+    /// Last known panel size (for persistence)
+    panel_size: Vec2,
+    /// Last known panel position (for persistence)
+    panel_pos: Option<Pos2>,
+    /// Viewport constraints for the panel
+    constraints: PanelConstraints,
+    /// Last known viewport size (to detect resize)
+    last_viewport_size: Vec2,
 }
 
 impl Default for SearchPanel {
@@ -81,6 +117,11 @@ impl Default for SearchPanel {
 }
 
 impl SearchPanel {
+    /// Default panel width.
+    const DEFAULT_WIDTH: f32 = 500.0;
+    /// Default panel height.
+    const DEFAULT_HEIGHT: f32 = 350.0;
+
     /// Create a new search panel.
     pub fn new() -> Self {
         Self {
@@ -93,7 +134,24 @@ impl SearchPanel {
             total_matches: 0,
             error_message: None,
             id_counter: 0,
+            panel_size: Vec2::new(Self::DEFAULT_WIDTH, Self::DEFAULT_HEIGHT),
+            panel_pos: None, // Will be computed on first show
+            constraints: search_panel_constraints(),
+            last_viewport_size: Vec2::ZERO,
         }
+    }
+
+    /// Get the panel size for persistence.
+    pub fn panel_size(&self) -> Vec2 {
+        self.panel_size
+    }
+
+    /// Set the panel size (from persistence), respecting constraints.
+    pub fn set_panel_size(&mut self, size: Vec2) {
+        self.panel_size = Vec2::new(
+            size.x.clamp(self.constraints.min_width, self.constraints.max_width),
+            size.y.clamp(self.constraints.min_height, self.constraints.max_height),
+        );
     }
 
     /// Check if the panel is open.
@@ -217,6 +275,9 @@ impl SearchPanel {
                 expanded: true,
             };
 
+            // Track absolute character offset from start of document
+            let mut line_start_offset = 0usize;
+
             for (line_idx, line) in content.lines().enumerate() {
                 let line_number = line_idx + 1;
 
@@ -244,11 +305,16 @@ impl SearchPanel {
                         break;
                     }
 
+                    let match_len = match_end - match_start;
+                    let char_offset = line_start_offset + match_start;
+
                     file_results.matches.push(SearchMatch {
                         line_number,
                         line_content: line.to_string(),
                         match_start,
                         match_end,
+                        char_offset,
+                        match_len,
                     });
                     self.total_matches += 1;
                 }
@@ -256,6 +322,9 @@ impl SearchPanel {
                 if file_results.truncated {
                     break;
                 }
+
+                // Update offset for next line (+1 for newline character)
+                line_start_offset += line.len() + 1;
             }
 
             if !file_results.matches.is_empty() {
@@ -268,7 +337,11 @@ impl SearchPanel {
         }
     }
 
-    /// Show the search panel.
+    /// Show the search panel with viewport constraints.
+    ///
+    /// The panel automatically constrains itself to fit within the visible
+    /// viewport, repositioning and resizing as needed when the window size
+    /// changes.
     pub fn show(
         &mut self,
         ctx: &egui::Context,
@@ -287,6 +360,32 @@ impl SearchPanel {
             self.close();
             return output;
         }
+
+        // Get current viewport
+        let viewport = ctx.screen_rect();
+        let viewport_size = viewport.size();
+
+        // Check if viewport size changed (window resize, DPI change, split view toggle)
+        let viewport_changed = (viewport_size - self.last_viewport_size).length() > 1.0;
+        if viewport_changed {
+            self.last_viewport_size = viewport_size;
+            // Force recalculation of position on next frame
+            self.panel_pos = None;
+        }
+
+        // Calculate constrained panel bounds
+        let constrained = if let Some(pos) = self.panel_pos {
+            // Use existing position but ensure it's still valid
+            let desired_rect = Rect::from_min_size(pos, self.panel_size);
+            crate::ui::constrain_rect_to_viewport(desired_rect, viewport, &self.constraints)
+        } else {
+            // Center panel in viewport on first show or after viewport change
+            center_panel_in_viewport(viewport, self.panel_size, &self.constraints)
+        };
+
+        // Update stored position/size
+        self.panel_pos = Some(constrained.pos);
+        self.panel_size = constrained.size;
 
         // Colors
         let bg_color = if is_dark {
@@ -331,21 +430,29 @@ impl SearchPanel {
             Color32::from_rgb(245, 247, 250)
         };
 
-        egui::Window::new("🔍 Search in Files")
+        // Build the window with constrained bounds
+        let mut window = egui::Window::new("🔍 Search in Files")
             .id(egui::Id::new("search_in_files_window"))
             .collapsible(false)
             .resizable(true)
-            .default_width(500.0)
-            .default_height(350.0)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_pos(constrained.pos)
+            .default_size(constrained.size)
             .frame(
                 egui::Frame::window(&ctx.style())
                     .fill(bg_color)
                     .stroke(egui::Stroke::new(1.0, border_color))
                     .rounding(8.0)
                     .inner_margin(12.0),
-            )
-            .show(ctx, |ui| {
+            );
+
+        // Apply size constraints to prevent manual resize beyond bounds
+        window = window
+            .min_width(self.constraints.min_width)
+            .min_height(self.constraints.min_height)
+            .max_width((viewport.width() - self.constraints.margin * 2.0).max(self.constraints.min_width))
+            .max_height((viewport.height() - self.constraints.margin * 2.0).max(self.constraints.min_height));
+
+        window.show(ctx, |ui| {
                 // Search input row
                 ui.horizontal(|ui| {
                     ui.label("Search:");
@@ -553,10 +660,12 @@ impl SearchPanel {
 
                                     // Handle click
                                     if response.clicked() {
-                                        output.navigate_to = Some((
-                                            file_result.path.clone(),
-                                            search_match.line_number,
-                                        ));
+                                        output.navigate_to = Some(SearchNavigationTarget {
+                                            path: file_result.path.clone(),
+                                            line_number: search_match.line_number,
+                                            char_offset: search_match.char_offset,
+                                            match_len: search_match.match_len,
+                                        });
                                         output.closed = true;
                                     }
                                 }
@@ -605,6 +714,9 @@ mod tests {
         let panel = SearchPanel::new();
         assert!(!panel.is_open());
         assert!(panel.query.is_empty());
+        // Check default size
+        assert_eq!(panel.panel_size().x, SearchPanel::DEFAULT_WIDTH);
+        assert_eq!(panel.panel_size().y, SearchPanel::DEFAULT_HEIGHT);
     }
 
     #[test]
@@ -620,14 +732,42 @@ mod tests {
     }
 
     #[test]
+    fn test_search_panel_size_constraints() {
+        let mut panel = SearchPanel::new();
+        // Copy constraint values to avoid borrow conflicts
+        let min_width = panel.constraints.min_width;
+        let min_height = panel.constraints.min_height;
+        let max_width = panel.constraints.max_width;
+        let max_height = panel.constraints.max_height;
+
+        // Test setting size within bounds
+        panel.set_panel_size(Vec2::new(400.0, 300.0));
+        assert_eq!(panel.panel_size().x, 400.0);
+        assert_eq!(panel.panel_size().y, 300.0);
+
+        // Test size clamped to minimum
+        panel.set_panel_size(Vec2::new(100.0, 50.0));
+        assert!(panel.panel_size().x >= min_width);
+        assert!(panel.panel_size().y >= min_height);
+
+        // Test size clamped to maximum
+        panel.set_panel_size(Vec2::new(2000.0, 2000.0));
+        assert!(panel.panel_size().x <= max_width);
+        assert!(panel.panel_size().y <= max_height);
+    }
+
+    #[test]
     fn test_search_match() {
         let m = SearchMatch {
             line_number: 10,
             line_content: "Hello world".to_string(),
             match_start: 6,
             match_end: 11,
+            char_offset: 100, // example absolute offset
+            match_len: 5,
         };
         assert_eq!(m.line_number, 10);
         assert_eq!(&m.line_content[m.match_start..m.match_end], "world");
+        assert_eq!(m.match_len, 5);
     }
 }

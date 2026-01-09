@@ -5,4 +5,6 @@
 
 mod sync_scroll;
 
+// Note: ScrollOrigin is available for future split-view bidirectional sync scrolling
+#[allow(unused_imports)]
 pub use sync_scroll::{ScrollOrigin, SyncScrollState};

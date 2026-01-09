@@ -1,209 +1,188 @@
-# Sync Scrolling System
+# Sync Scrolling Implementation
 
 ## Overview
 
-The sync scrolling system provides synchronized scroll position between Raw and Rendered views. When enabled, switching between view modes maintains the scroll position so users don't lose their place in the document.
-
-**Supported File Types:**
-- **Markdown files (.md)**: Full bidirectional sync (Raw ↔ Rendered)
-- **Structured files (JSON, YAML, TOML)**: Full bidirectional sync (Raw ↔ TreeViewer)
+Sync scrolling maintains the user's document position when switching between Raw and Rendered view modes. When toggling view modes (Ctrl+E), the scroll position is synchronized using a **hybrid approach**:
+- **Boundaries (top/bottom)**: Percentage-based to ensure you stay at document edges
+- **Middle content**: Line-based with interpolation to show the same content
 
 ## Architecture
 
-### Module Structure
-
-```
-src/preview/
-├── mod.rs           # Module exports
-└── sync_scroll.rs   # Core sync scrolling logic
-```
-
 ### Key Components
 
-#### SyncScrollState
+1. **Tab State** (`src/state.rs`):
+   - `scroll_offset: f32` - Current scroll position in pixels
+   - `content_height: f32` - Total content height of scroll area
+   - `viewport_height: f32` - Visible viewport height
+   - `pending_scroll_offset: Option<f32>` - Target scroll offset to apply
+   - `pending_scroll_ratio: Option<f32>` - Target scroll ratio (0.0 to 1.0)
+   - `pending_scroll_to_line: Option<usize>` - Target line for line-based sync
+   - `raw_line_height: f32` - Actual line height in Raw mode
+   - `rendered_line_mappings: Vec<(usize, usize, f32)>` - Line-to-Y position mappings
 
-The main state machine that manages synchronized scrolling:
+2. **Mode Toggle** (`src/app.rs`):
+   - `handle_toggle_view_mode()` - Determines sync strategy and stores target
+   - `find_rendered_y_for_line_interpolated()` - Precise line-to-Y lookup
+   - `find_source_line_for_rendered_y_interpolated()` - Y-to-line reverse lookup
 
-```rust
-pub struct SyncScrollState {
-    pub enabled: bool,
-    mappings: Vec<BlockMapping>,
-    scroll_origin: ScrollOrigin,
-    last_scroll_time: Option<Instant>,
-    config: SyncScrollConfig,
-    // ... scroll tracking fields
-}
-```
-
-#### ScrollOrigin
-
-Enum to track who initiated the last scroll event, preventing feedback loops:
-
-```rust
-pub enum ScrollOrigin {
-    Raw,       // Scroll from Raw editor
-    Rendered,  // Scroll from Rendered view
-    External,  // External navigation (outline panel)
-    None,      // Idle state
-}
-```
-
-#### BlockMapping
-
-Maps source line ranges to rendered Y positions:
-
-```rust
-pub struct BlockMapping {
-    pub source_lines: (usize, usize),  // 1-indexed
-    pub rendered_range: (f32, f32),    // pixels
-    pub block_type: BlockType,
-}
-```
-
-## How It Works
-
-### View Mode Switching
-
-When the user switches between Raw and Rendered modes:
-
-1. **Record current scroll position** - Store the scroll offset
-2. **Calculate source line** - Convert scroll offset to source line number
-3. **Translate to target mode** - Convert source line to target scroll position
-4. **Apply scroll target** - Set pending scroll position for target view
-
-### Line Mapping Algorithm
-
-The system uses block-level granularity for mapping:
-
-1. **With mappings**: Interpolate within blocks for precise positioning
-2. **Between mappings**: Interpolate between adjacent blocks
-3. **Fallback**: Use proportional calculation based on total lines/height
-
-```rust
-// Example: Convert source line to rendered offset
-pub fn line_to_rendered_offset(&self, line: usize) -> f32 {
-    // Find mapping containing this line
-    if let Some(mapping) = self.mappings.iter().find(|m| m.contains_line(line)) {
-        // Interpolate within the block
-        let progress = calculate_progress(line, mapping);
-        return interpolate(mapping.rendered_range, progress);
-    }
-    // Fall back to proportional calculation
-    self.proportional_line_to_rendered(line)
-}
-```
-
-### Debouncing
-
-Scroll events are debounced to prevent:
-- Feedback loops between views
-- Excessive synchronization calls
-- Janky scroll behavior
-
-Default debounce: 16ms (~60fps)
-
-## Configuration
+3. **Editors**:
+   - `EditorWidget` (`src/editor/widget.rs`) - Raw text editor, tracks `raw_line_height`
+   - `MarkdownEditor` (`src/markdown/editor.rs`) - Rendered WYSIWYG editor, builds line mappings
 
 ### Settings
 
-The `sync_scroll_enabled` setting in `Settings` controls this feature:
+- `sync_scroll_enabled: bool` in `Settings` - User preference for sync scrolling
+- Toggled via ribbon button or settings panel
+
+## Hybrid Scroll Sync Algorithm
+
+### Decision Logic
 
 ```rust
-pub struct Settings {
-    // ...
-    pub sync_scroll_enabled: bool,  // Default: true
+if at_top {
+    // Within 5px of top - snap to top
+    pending_scroll_offset = Some(0.0);
+} else if at_bottom {
+    // Within 5px of max scroll - use ratio=1.0 to stay at bottom
+    pending_scroll_ratio = Some(1.0);
+} else {
+    // In the middle - use line-based mapping for content preservation
+    // Raw→Rendered: Store target line
+    // Rendered→Raw: Look up line from Y position, calculate raw offset
 }
 ```
 
-### User Interface
+### Line-Based with Interpolation
 
-- **Ribbon**: Toggle button (🔗/⛓) in the View group
-- **Settings Panel**: Checkbox in Editor section
-- **Keyboard**: Currently no shortcut (can be added)
-
-## Implementation Details
-
-### App Integration
-
-The sync scroll state is stored per-tab in `FerriteApp`:
+The key innovation is **interpolating within elements** for sub-element precision:
 
 ```rust
-pub struct FerriteApp {
-    sync_scroll_states: HashMap<usize, SyncScrollState>,
-    // ...
-}
-```
-
-### View Mode Toggle Handler
-
-```rust
-fn handle_toggle_view_mode(&mut self) {
-    if let Some(tab) = self.state.active_tab_mut() {
-        let old_mode = tab.view_mode;
-        let new_mode = tab.toggle_view_mode();
-        
-        if sync_enabled {
-            // Get sync state for this tab
-            let sync_state = self.sync_scroll_states.entry(tab_id)
-                .or_insert_with(SyncScrollState::new);
+fn find_rendered_y_for_line_interpolated(mappings, target_line, content_height) {
+    // Find element containing target_line
+    for (i, (start, end, y)) in mappings {
+        if target_line in start..=end {
+            // Calculate element height
+            let element_height = next_mapping.y - y;
             
-            // Calculate target scroll position
-            match (old_mode, new_mode) {
-                (ViewMode::Raw, ViewMode::Rendered) => {
-                    let source_line = sync_state.raw_offset_to_line(current_scroll, line_height);
-                    self.pending_scroll_to_line = Some(source_line);
-                }
-                (ViewMode::Rendered, ViewMode::Raw) => {
-                    let source_line = sync_state.rendered_offset_to_line(current_scroll);
-                    self.pending_scroll_to_line = Some(source_line);
-                }
-            }
+            // Interpolate within element
+            let progress = (target_line - start) / (end - start + 1);
+            return y + progress * element_height;
         }
     }
 }
 ```
 
-## Scroll Offset Tracking
+This ensures that if you're looking at line 150 (which is 50% through a code block spanning lines 100-200), you'll see the same line 150 in the other mode, not just the start of the code block.
 
-Each editor component reports its current scroll offset back to the tab state:
+### Two-Frame Application
 
-| Component | Field | Updated |
-|-----------|-------|---------|
-| `EditorWidget` (Raw) | `tab.scroll_offset` | ✅ On every frame |
-| `MarkdownEditor` (Rendered) | `tab.scroll_offset` via `scroll_offset` output | ✅ On every frame |
-| `TreeViewer` (JSON/YAML/TOML) | `tab.scroll_offset` via `scroll_offset` output | ✅ On every frame |
+```
+Frame 1: Render, build mappings, convert pending_scroll_to_line → pending_scroll_offset
+Frame 2: Apply pending_scroll_offset via ScrollArea
+```
 
-This ensures `tab.scroll_offset` always reflects the current scroll position regardless of view mode.
+## Flow Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     User Presses Ctrl+E                          │
+└─────────────────────────────────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ handle_toggle_view_mode()                                        │
+│   if at_top → pending_scroll_offset = 0                          │
+│   if at_bottom → pending_scroll_ratio = 1.0                      │
+│   else (middle):                                                 │
+│     Raw→Rendered: pending_scroll_to_line = topmost_line          │
+│     Rendered→Raw: pending_scroll_offset = line × line_height     │
+└─────────────────────────────────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ Frame 1: Render New Mode                                         │
+│   1. Render content, build fresh line mappings                   │
+│   2. If pending_scroll_to_line:                                  │
+│      - Use interpolation to find exact Y position                │
+│      - Store as pending_scroll_offset                            │
+│   3. If pending_scroll_ratio:                                    │
+│      - Convert to offset using actual content_height             │
+│   4. Request repaint                                             │
+└─────────────────────────────────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ Frame 2: Apply Scroll Position                                   │
+│   Apply pending_scroll_offset via vertical_scroll_offset()       │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## Why This Hybrid Approach?
+
+| Scenario | Pure Percentage | Pure Line-Based | Hybrid |
+|----------|----------------|-----------------|--------|
+| At top | ✓ Stays at top | ✓ | ✓ |
+| At bottom | ✓ Stays at bottom | ✗ May be 75% down | ✓ |
+| In middle | ✗ Different content | ✓ Same content | ✓ |
+
+The hybrid approach gives the best of both worlds:
+- **Boundary preservation**: Top/bottom stay at edges
+- **Content preservation**: Middle content stays visible
+
+## Edge Cases
+
+### No Scrollable Content
+If `content_height <= viewport_height`, there's nothing to scroll, so sync is skipped.
+
+### Boundary Detection
+- **Top boundary**: Within 5px of scroll=0 → snap to top
+- **Bottom boundary**: Within 5px of max_scroll → use ratio=1.0 to stay at bottom
+
+### Empty or Missing Line Mappings
+On first toggle to Rendered mode, mappings may be empty. The system falls back to:
+1. Estimate line ratio: `target_line / total_lines`
+2. Convert to scroll offset: `line_ratio × max_scroll`
+
+### Large Elements
+The interpolation handles large elements (like code blocks spanning 100+ lines) by calculating progress within the element, ensuring sub-element precision.
 
 ## Future Enhancements
 
-The infrastructure supports future features:
+The `SyncScrollState` infrastructure in `src/preview/sync_scroll.rs` is designed for future split-view support:
 
-1. **Split View Sync**: Real-time bidirectional scrolling in side-by-side mode
-2. **Visual Indicators**: Gutter overlay showing visible region in other view
-3. **Smooth Animation**: Animated scroll transitions when switching modes
-4. **Block-Level Mapping**: Build mappings from rendered AST for precision
+1. **Split View**: Show Raw and Rendered side-by-side with real-time sync
+2. **Bidirectional Sync**: Scrolling either pane updates the other
+3. **Debouncing**: Prevent feedback loops in split-view
 
 ## Testing
 
-Unit tests are provided in `sync_scroll.rs`:
+### Manual Test Scenarios
 
-```rust
-#[test]
-fn test_raw_offset_to_line() { ... }
+1. **Basic Toggle**:
+   - Open a markdown file with 100+ lines
+   - Scroll to middle (50%)
+   - Toggle view mode (Ctrl+E)
+   - Verify position is approximately maintained
 
-#[test]
-fn test_line_to_rendered_with_mappings() { ... }
+2. **Edge Positions**:
+   - Test at top (0%), middle (50%), bottom (100%)
+   - Toggle back and forth
 
-#[test]
-fn test_rendered_offset_to_line() { ... }
+3. **Different Content Types**:
+   - Documents with many headings
+   - Documents with code blocks
+   - Documents with nested lists
 
-#[test]
-fn test_proportional_fallback() { ... }
-```
+4. **Sync Scrolling Disabled**:
+   - Disable sync scrolling in settings
+   - Toggle view mode
+   - Verify scroll position resets to 0
 
-## Related Documentation
+## Related Files
 
-- [View Mode Persistence](view-mode-persistence.md)
-- [WYSIWYG Editor](wysiwyg-editor.md)
-- [Editor Widget](editor-widget.md)
+- `src/state.rs` - Tab struct with scroll state
+- `src/app.rs` - View mode toggle logic
+- `src/editor/widget.rs` - Raw editor scroll handling
+- `src/markdown/editor.rs` - Rendered editor scroll handling
+- `src/preview/sync_scroll.rs` - Sync scroll infrastructure (future)
+- `src/config/settings.rs` - sync_scroll_enabled setting

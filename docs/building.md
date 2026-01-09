@@ -2,7 +2,7 @@
 
 This guide covers building Ferrite from source for Windows, Linux, and macOS.
 
-## Prerequisites
+## Prerequisites 
 
 ### All Platforms
 
@@ -18,7 +18,7 @@ rustc --version
 cargo --version
 ```
 
-### Platform-Specific Requirements
+### Platform-Specific Requirements sda
 
 #### Windows
 

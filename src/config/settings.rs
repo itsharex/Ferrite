@@ -68,9 +68,10 @@ impl EditorFont {
 
 /// Editor view modes for markdown editing.
 ///
-/// Two modes are available:
+/// Three modes are available:
 /// - `Raw`: Plain markdown text editing using a standard text editor
 /// - `Rendered`: WYSIWYG editing with rendered markdown elements
+/// - `Split`: Side-by-side split view with raw editor on left and preview on right
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ViewMode {
@@ -79,13 +80,16 @@ pub enum ViewMode {
     Raw,
     /// WYSIWYG rendered editing (MarkdownEditor)
     Rendered,
+    /// Split view: raw editor (left) + rendered preview (right)
+    Split,
 }
 
 impl ViewMode {
-    /// Toggle between Raw and Rendered modes.
+    /// Cycle through view modes: Raw → Split → Rendered → Raw
     pub fn toggle(&self) -> Self {
         match self {
-            ViewMode::Raw => ViewMode::Rendered,
+            ViewMode::Raw => ViewMode::Split,
+            ViewMode::Split => ViewMode::Rendered,
             ViewMode::Rendered => ViewMode::Raw,
         }
     }
@@ -95,6 +99,7 @@ impl ViewMode {
         match self {
             ViewMode::Raw => "Raw",
             ViewMode::Rendered => "Rendered",
+            ViewMode::Split => "Split",
         }
     }
 
@@ -104,7 +109,18 @@ impl ViewMode {
         match self {
             ViewMode::Raw => "📝",
             ViewMode::Rendered => "👁",
+            ViewMode::Split => "⫿",
         }
+    }
+
+    /// Check if this mode shows the raw editor.
+    pub fn shows_raw(&self) -> bool {
+        matches!(self, ViewMode::Raw | ViewMode::Split)
+    }
+
+    /// Check if this mode shows the rendered preview.
+    pub fn shows_rendered(&self) -> bool {
+        matches!(self, ViewMode::Rendered | ViewMode::Split)
     }
 }
 
@@ -195,9 +211,18 @@ pub struct TabInfo {
     /// Scroll position
     #[serde(default)]
     pub scroll_offset: f32,
-    /// View mode for this tab (raw or rendered)
+    /// View mode for this tab (raw, rendered, or split)
     #[serde(default)]
     pub view_mode: ViewMode,
+    /// Split view ratio (0.0 to 1.0, where ratio is the proportion for the left pane)
+    /// Default is 0.5 (50/50 split). Only used when view_mode is Split.
+    #[serde(default = "default_split_ratio")]
+    pub split_ratio: f32,
+}
+
+/// Default split ratio for TabInfo (50/50 split)
+fn default_split_ratio() -> f32 {
+    0.5
 }
 
 impl Default for TabInfo {
@@ -208,6 +233,7 @@ impl Default for TabInfo {
             cursor_position: (0, 0),
             scroll_offset: 0.0,
             view_mode: ViewMode::Raw, // New documents default to raw mode
+            split_ratio: 0.5,         // Default to 50/50 split
         }
     }
 }
@@ -253,11 +279,14 @@ pub struct Settings {
     /// Whether to use spaces instead of tabs
     pub use_spaces: bool,
 
-    /// Whether to auto-save files
-    pub auto_save: bool,
+    /// Default auto-save state for new tabs/documents
+    /// When true, new documents will have auto-save enabled by default
+    pub auto_save_enabled_default: bool,
 
-    /// Auto-save interval in seconds (if auto_save is enabled)
-    pub auto_save_interval_secs: u32,
+    /// Auto-save delay in milliseconds after last edit before triggering save
+    /// Uses temp-file based strategy to avoid overwriting main file prematurely
+    /// Default is 15000ms (15 seconds)
+    pub auto_save_delay_ms: u32,
 
     // ─────────────────────────────────────────────────────────────────────────
     // Session & History
@@ -327,6 +356,80 @@ pub struct Settings {
 
     /// Maximum number of recent workspaces to remember
     pub max_recent_workspaces: usize,
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Zen Mode Settings
+    // ─────────────────────────────────────────────────────────────────────────
+    /// Maximum column width for Zen Mode (in characters, approx 70-90)
+    pub zen_max_column_width: f32,
+
+    /// Whether Zen Mode was enabled in the last session (for restore)
+    pub zen_mode_enabled: bool,
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Code Folding Settings
+    // ─────────────────────────────────────────────────────────────────────────
+    /// Whether code folding is enabled globally
+    pub folding_enabled: bool,
+
+    /// Whether to show fold indicators in the gutter
+    pub folding_show_indicators: bool,
+
+    /// Whether to fold Markdown headings
+    pub fold_headings: bool,
+
+    /// Whether to fold fenced code blocks
+    pub fold_code_blocks: bool,
+
+    /// Whether to fold list hierarchies
+    pub fold_lists: bool,
+
+    /// Whether to use indentation-based folding for JSON/YAML
+    pub fold_indentation: bool,
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Live Pipeline Settings
+    // ─────────────────────────────────────────────────────────────────────────
+    /// Whether the Live Pipeline feature is enabled (for JSON/YAML files)
+    pub pipeline_enabled: bool,
+
+    /// Debounce delay in milliseconds before auto-executing pipeline command
+    pub pipeline_debounce_ms: u32,
+
+    /// Maximum output size in bytes (to prevent memory issues)
+    pub pipeline_max_output_bytes: u32,
+
+    /// Maximum runtime in milliseconds before killing the process
+    pub pipeline_max_runtime_ms: u32,
+
+    /// Height of the pipeline panel in pixels
+    pub pipeline_panel_height: f32,
+
+    /// Recent pipeline commands (persisted across sessions)
+    pub pipeline_recent_commands: Vec<String>,
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Minimap Settings
+    // ─────────────────────────────────────────────────────────────────────────
+    /// Whether the minimap is enabled
+    pub minimap_enabled: bool,
+
+    /// Width of the minimap in pixels
+    pub minimap_width: f32,
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Bracket Matching Settings
+    // ─────────────────────────────────────────────────────────────────────────
+    /// Whether to highlight matching brackets and emphasis pairs when cursor is adjacent
+    /// Supports (), [], {}, <>, and markdown emphasis ** and __
+    pub highlight_matching_pairs: bool,
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Syntax Highlighting Settings
+    // ─────────────────────────────────────────────────────────────────────────
+    /// Whether to enable syntax highlighting for source code files in raw editor mode
+    /// Supports Rust, Python, JavaScript, TypeScript, and many other languages
+    pub syntax_highlighting_enabled: bool,
 }
 
 impl Default for Settings {
@@ -343,8 +446,8 @@ impl Default for Settings {
             word_wrap: true,
             tab_size: 4,
             use_spaces: true,
-            auto_save: false,
-            auto_save_interval_secs: 60,
+            auto_save_enabled_default: false,
+            auto_save_delay_ms: 15000, // 15 seconds default
 
             // Session & History
             recent_files: Vec::new(),
@@ -375,6 +478,36 @@ impl Default for Settings {
             // Workspace Settings
             recent_workspaces: Vec::new(),
             max_recent_workspaces: 10,
+
+            // Zen Mode Settings
+            zen_max_column_width: 80.0, // ~80 characters default
+            zen_mode_enabled: false,
+
+            // Code Folding Settings
+            folding_enabled: true,           // Folding enabled by default
+            folding_show_indicators: true,   // Show fold indicators in gutter
+            fold_headings: true,             // Fold headings by default
+            fold_code_blocks: true,          // Fold code blocks by default
+            fold_lists: true,                // Fold lists by default
+            fold_indentation: true,          // Indentation folding for JSON/YAML
+
+            // Live Pipeline Settings
+            pipeline_enabled: true,          // Feature enabled by default
+            pipeline_debounce_ms: 500,       // 500ms debounce
+            pipeline_max_output_bytes: 1024 * 1024, // 1 MB max output
+            pipeline_max_runtime_ms: 30000,  // 30 seconds max runtime
+            pipeline_panel_height: 200.0,    // Default panel height
+            pipeline_recent_commands: Vec::new(),
+
+            // Minimap Settings
+            minimap_enabled: true,           // Minimap enabled by default
+            minimap_width: 80.0,             // Default minimap width
+
+            // Bracket Matching Settings
+            highlight_matching_pairs: true,  // Bracket matching enabled by default
+
+            // Syntax Highlighting Settings
+            syntax_highlighting_enabled: true, // Syntax highlighting enabled by default
         }
     }
 }
@@ -426,6 +559,32 @@ impl Settings {
     pub const MIN_OUTLINE_WIDTH: f32 = 120.0;
     /// Maximum outline panel width.
     pub const MAX_OUTLINE_WIDTH: f32 = 500.0;
+    /// Minimum Zen Mode column width (characters).
+    pub const MIN_ZEN_COLUMN_WIDTH: f32 = 50.0;
+    /// Maximum Zen Mode column width (characters).
+    pub const MAX_ZEN_COLUMN_WIDTH: f32 = 120.0;
+    /// Minimum pipeline debounce in milliseconds.
+    pub const MIN_PIPELINE_DEBOUNCE_MS: u32 = 100;
+    /// Maximum pipeline debounce in milliseconds.
+    pub const MAX_PIPELINE_DEBOUNCE_MS: u32 = 5000;
+    /// Minimum pipeline output size in bytes (1 KB).
+    pub const MIN_PIPELINE_OUTPUT_BYTES: u32 = 1024;
+    /// Maximum pipeline output size in bytes (10 MB).
+    pub const MAX_PIPELINE_OUTPUT_BYTES: u32 = 10 * 1024 * 1024;
+    /// Minimum pipeline runtime in milliseconds (1 second).
+    pub const MIN_PIPELINE_RUNTIME_MS: u32 = 1000;
+    /// Maximum pipeline runtime in milliseconds (5 minutes).
+    pub const MAX_PIPELINE_RUNTIME_MS: u32 = 300000;
+    /// Minimum pipeline panel height.
+    pub const MIN_PIPELINE_PANEL_HEIGHT: f32 = 100.0;
+    /// Maximum pipeline panel height.
+    pub const MAX_PIPELINE_PANEL_HEIGHT: f32 = 500.0;
+    /// Maximum number of recent pipeline commands.
+    pub const MAX_PIPELINE_RECENT_COMMANDS: usize = 20;
+    /// Minimum minimap width.
+    pub const MIN_MINIMAP_WIDTH: f32 = 40.0;
+    /// Maximum minimap width.
+    pub const MAX_MINIMAP_WIDTH: f32 = 150.0;
 
     /// Sanitize settings by clamping values to valid ranges.
     ///
@@ -463,10 +622,8 @@ impl Settings {
         // Trim recent files to max
         self.recent_files.truncate(self.max_recent_files);
 
-        // Ensure auto-save interval is reasonable
-        if self.auto_save && self.auto_save_interval_secs < 5 {
-            self.auto_save_interval_secs = 5;
-        }
+        // Ensure auto-save delay is reasonable (minimum 5 seconds, max 5 minutes)
+        self.auto_save_delay_ms = self.auto_save_delay_ms.clamp(5000, 300000);
 
         // Ensure active_tab_index is valid
         if !self.last_open_tabs.is_empty() && self.active_tab_index >= self.last_open_tabs.len() {
@@ -477,6 +634,32 @@ impl Settings {
         self.outline_width = self
             .outline_width
             .clamp(Self::MIN_OUTLINE_WIDTH, Self::MAX_OUTLINE_WIDTH);
+
+        // Clamp Zen Mode column width
+        self.zen_max_column_width = self
+            .zen_max_column_width
+            .clamp(Self::MIN_ZEN_COLUMN_WIDTH, Self::MAX_ZEN_COLUMN_WIDTH);
+
+        // Clamp pipeline settings
+        self.pipeline_debounce_ms = self
+            .pipeline_debounce_ms
+            .clamp(Self::MIN_PIPELINE_DEBOUNCE_MS, Self::MAX_PIPELINE_DEBOUNCE_MS);
+        self.pipeline_max_output_bytes = self
+            .pipeline_max_output_bytes
+            .clamp(Self::MIN_PIPELINE_OUTPUT_BYTES, Self::MAX_PIPELINE_OUTPUT_BYTES);
+        self.pipeline_max_runtime_ms = self
+            .pipeline_max_runtime_ms
+            .clamp(Self::MIN_PIPELINE_RUNTIME_MS, Self::MAX_PIPELINE_RUNTIME_MS);
+        self.pipeline_panel_height = self
+            .pipeline_panel_height
+            .clamp(Self::MIN_PIPELINE_PANEL_HEIGHT, Self::MAX_PIPELINE_PANEL_HEIGHT);
+        self.pipeline_recent_commands
+            .truncate(Self::MAX_PIPELINE_RECENT_COMMANDS);
+
+        // Clamp minimap width
+        self.minimap_width = self
+            .minimap_width
+            .clamp(Self::MIN_MINIMAP_WIDTH, Self::MAX_MINIMAP_WIDTH);
     }
 
     /// Load settings and sanitize them to ensure validity.
@@ -567,11 +750,17 @@ mod tests {
             serde_json::to_string(&ViewMode::Rendered).unwrap(),
             "\"rendered\""
         );
+        assert_eq!(
+            serde_json::to_string(&ViewMode::Split).unwrap(),
+            "\"split\""
+        );
     }
 
     #[test]
     fn test_view_mode_toggle() {
-        assert_eq!(ViewMode::Raw.toggle(), ViewMode::Rendered);
+        // Raw → Split → Rendered → Raw
+        assert_eq!(ViewMode::Raw.toggle(), ViewMode::Split);
+        assert_eq!(ViewMode::Split.toggle(), ViewMode::Rendered);
         assert_eq!(ViewMode::Rendered.toggle(), ViewMode::Raw);
     }
 
@@ -579,8 +768,20 @@ mod tests {
     fn test_view_mode_labels() {
         assert_eq!(ViewMode::Raw.label(), "Raw");
         assert_eq!(ViewMode::Rendered.label(), "Rendered");
+        assert_eq!(ViewMode::Split.label(), "Split");
         assert_eq!(ViewMode::Raw.icon(), "📝");
         assert_eq!(ViewMode::Rendered.icon(), "👁");
+        assert_eq!(ViewMode::Split.icon(), "⫿");
+    }
+
+    #[test]
+    fn test_view_mode_shows_raw_rendered() {
+        assert!(ViewMode::Raw.shows_raw());
+        assert!(!ViewMode::Raw.shows_rendered());
+        assert!(!ViewMode::Rendered.shows_raw());
+        assert!(ViewMode::Rendered.shows_rendered());
+        assert!(ViewMode::Split.shows_raw());
+        assert!(ViewMode::Split.shows_rendered());
     }
 
     #[test]
@@ -639,11 +840,26 @@ mod tests {
             cursor_position: (10, 5),
             scroll_offset: 100.0,
             view_mode: ViewMode::Rendered,
+            split_ratio: 0.6,
         };
 
         let json = serde_json::to_string(&tab).unwrap();
         let deserialized: TabInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(tab, deserialized);
+    }
+
+    #[test]
+    fn test_tab_info_default_split_ratio() {
+        let tab = TabInfo::default();
+        assert_eq!(tab.split_ratio, 0.5); // Default to 50/50 split
+    }
+
+    #[test]
+    fn test_tab_info_backward_compatibility_split_ratio() {
+        // Old JSON without split_ratio field should default to 0.5
+        let json = r#"{"path": "/test.md", "modified": false, "cursor_position": [0, 0], "scroll_offset": 0.0, "view_mode": "raw"}"#;
+        let tab: TabInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(tab.split_ratio, 0.5);
     }
 
     #[test]

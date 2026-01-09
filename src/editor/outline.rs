@@ -492,7 +492,7 @@ fn remove_single_wrapper(text: &str, wrapper: char) -> String {
             // Only treat as wrapper if it's at a word boundary
             if !in_wrapper && (prev_is_space || result.is_empty()) && !next_is_space {
                 in_wrapper = true;
-            } else if in_wrapper && (!next_is_space || chars.peek().is_none()) {
+            } else if in_wrapper && (next_is_space || chars.peek().is_none()) {
                 in_wrapper = false;
             } else {
                 result.push(c);

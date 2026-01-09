@@ -15,20 +15,43 @@ A fast, lightweight text editor for Markdown, JSON, YAML, and TOML files. Built 
 
 ## Features
 
+### Core Editing
 - **WYSIWYG Markdown Editing** - Edit markdown with live preview, click-to-edit formatting, and syntax highlighting
 - **Multi-Format Support** - Native support for Markdown, JSON, YAML, and TOML files
 - **Tree Viewer** - Hierarchical view for JSON/YAML/TOML with inline editing, expand/collapse, and path copying
-- **Workspace Mode** - Open folders as workspaces with file tree, quick switcher (Ctrl+P), and search-in-files (Ctrl+Shift+F)
+- **Find & Replace** - Search with regex support and match highlighting
+- **Undo/Redo** - Full undo/redo support per tab
+
+### View Modes
+- **Split View** - Side-by-side raw editor and rendered preview with resizable divider
+- **Zen Mode** - Distraction-free writing with centered text column
+- **Sync Scrolling** - Bidirectional scroll sync between raw and rendered views
+
+### Editor Features
+- **Syntax Highlighting** - Full-file syntax highlighting for 40+ languages (Rust, Python, JavaScript, Go, etc.)
+- **Code Folding** - Fold detection with gutter indicators (▶/▼) for headings, code blocks, and lists (text hiding deferred to v0.3.0)
+- **Minimap** - VS Code-style navigation panel with click-to-jump and search highlights
+- **Bracket Matching** - Highlight matching brackets `()[]{}<>` and emphasis pairs `**` `__`
+- **Auto-Save** - Configurable auto-save with temp-file safety
+- **Line Numbers** - Optional line number gutter
+
+### MermaidJS Diagrams
+Native rendering of 11 diagram types directly in the preview:
+- Flowchart, Sequence, Pie, State, Mindmap
+- Class, ER, Git Graph, Gantt, Timeline, User Journey
+
+### Workspace Features
+- **Workspace Mode** - Open folders with file tree, quick switcher (Ctrl+P), and search-in-files (Ctrl+Shift+F)
+- **Git Integration** - Visual status indicators showing modified, added, untracked, and ignored files
+- **Session Persistence** - Restore open tabs, cursor positions, and scroll offsets on restart
+
+### Additional Features
 - **Light & Dark Themes** - Beautiful themes with runtime switching
 - **Document Outline** - Navigate large documents with the outline panel
 - **Export Options** - Export to HTML with themed styling, or copy as HTML
-- **Sync Scrolling** - Bidirectional scroll sync between raw and rendered views
 - **Formatting Toolbar** - Quick access to bold, italic, headings, lists, links, and more
+- **Live Pipeline** - Pipe JSON/YAML content through shell commands (for developers)
 - **Custom Window** - Borderless window with custom title bar and resize handles
-- **Native Dialogs** - Platform-native file open/save dialogs
-- **Tab System** - Work with multiple files simultaneously
-- **Find & Replace** - Search with regex support and match highlighting
-- **Undo/Redo** - Full undo/redo support per tab
 
 ## Installation
 
@@ -39,8 +62,31 @@ Download the latest release for your platform from [GitHub Releases](https://git
 | Platform | Download |
 |----------|----------|
 | Windows  | `ferrite-windows-x64.zip` |
-| Linux    | `ferrite-linux-x64.tar.gz` or `.deb` |
-| macOS    | `Ferrite.dmg` |
+| Linux    | `ferrite-editor_amd64.deb` (recommended) or `ferrite-linux-x64.tar.gz` |
+| macOS    | `ferrite-macos-x64.tar.gz` |
+
+#### Linux Installation
+
+**Using .deb package (Debian/Ubuntu/Mint - Recommended):**
+```bash
+# Download the .deb file, then install with:
+sudo apt install ./ferrite-editor_amd64.deb
+
+# Or using dpkg:
+sudo dpkg -i ferrite-editor_amd64.deb
+```
+
+This will:
+- Install Ferrite to `/usr/bin/ferrite`
+- Add desktop entry (appears in your app menu)
+- Register file associations for `.md`, `.json`, `.yaml`, `.toml` files
+- Install icons for the system
+
+**Using tar.gz (any Linux distro):**
+```bash
+tar -xzf ferrite-linux-x64.tar.gz
+./ferrite
+```
 
 ### Build from Source
 
@@ -107,8 +153,8 @@ cargo run --release
 Ferrite supports three view modes for Markdown files:
 
 - **Raw** - Plain text editing with syntax highlighting
-- **Rendered** - Read-only preview of rendered markdown
-- **Both** - Split view with raw editor and live preview
+- **Rendered** - WYSIWYG editing with rendered markdown
+- **Split** - Side-by-side raw editor and live preview
 
 Toggle between modes using the toolbar buttons or keyboard shortcuts.
 
@@ -151,7 +197,8 @@ Toggle between modes using the toolbar buttons or keyboard shortcuts.
 |----------|--------|
 | `F11` | Toggle fullscreen |
 | `Ctrl+,` | Open settings |
-| `F1` | Help/shortcuts |
+| `Ctrl+Shift+[` | Fold all |
+| `Ctrl+Shift+]` | Unfold all |
 
 ## Configuration
 
@@ -162,6 +209,14 @@ Settings are stored in platform-specific locations:
 - **macOS:** `~/Library/Application Support/ferrite/`
 
 Workspace settings are stored in `.ferrite/` within the workspace folder.
+
+### Settings Panel
+
+Access settings via `Ctrl+,` or the gear icon. Configure:
+
+- **Appearance:** Theme, font family, font size
+- **Editor:** Word wrap, line numbers, minimap, bracket matching, code folding, syntax highlighting
+- **Files:** Auto-save, recent files history
 
 ## Roadmap
 
@@ -200,9 +255,11 @@ git push origin feature/your-feature
 | GUI Framework | egui 0.28 + eframe 0.28 |
 | Markdown Parser | comrak 0.22 |
 | Syntax Highlighting | syntect 5.1 |
+| Git Integration | git2 0.19 |
 | File Dialogs | rfd 0.14 |
 | Clipboard | arboard 3 |
 | File Watching | notify 6 |
+| Fuzzy Matching | fuzzy-matcher 0.3 |
 
 ## License
 
@@ -213,4 +270,5 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - [egui](https://github.com/emilk/egui) - Immediate mode GUI library for Rust
 - [comrak](https://github.com/kivikakk/comrak) - CommonMark + GFM compatible Markdown parser
 - [syntect](https://github.com/trishume/syntect) - Syntax highlighting library
+- [git2](https://github.com/rust-lang/git2-rs) - libgit2 bindings for Rust
 - [Inter](https://rsms.me/inter/) and [JetBrains Mono](https://www.jetbrains.com/lp/mono/) fonts

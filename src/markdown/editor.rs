@@ -55,8 +55,8 @@ use crate::markdown::parser::{
     parse_markdown, HeadingLevel, ListType, MarkdownNode, MarkdownNodeType,
 };
 use crate::markdown::widgets::{
-    CodeBlockData, EditableCodeBlock, EditableTable, RenderedLinkState, RenderedLinkWidget,
-    TableData, WidgetColors,
+    CodeBlockData, EditableCodeBlock, EditableTable, MermaidBlock, MermaidBlockData,
+    RenderedLinkState, RenderedLinkWidget, TableData, WidgetColors,
 };
 use eframe::egui::{
     self, Color32, FontId, Key, Response, RichText, ScrollArea, TextEdit, Ui, Vec2,
@@ -95,6 +95,25 @@ pub struct MarkdownEditorOutput {
     pub focused_element: Option<FocusedElement>,
     /// Current scroll offset (for sync scrolling)
     pub scroll_offset: f32,
+    /// Total content height inside the scroll area (for sync scrolling)
+    pub content_height: f32,
+    /// Viewport height of the scroll area (for sync scrolling)
+    pub viewport_height: f32,
+    /// Line-to-Y mappings for rendered mode (source_line -> rendered_y)
+    /// Used for accurate scroll sync between Raw and Rendered modes
+    pub line_mappings: Vec<LineMapping>,
+}
+
+/// Maps a source line range to a rendered Y position range.
+/// Used for scroll synchronization between Raw and Rendered views.
+#[derive(Debug, Clone, Default)]
+pub struct LineMapping {
+    /// Start line in source (1-indexed)
+    pub start_line: usize,
+    /// End line in source (1-indexed)  
+    pub end_line: usize,
+    /// Y position where this element starts in rendered view
+    pub rendered_y: f32,
 }
 
 /// Information about the currently focused element in rendered mode.
@@ -403,6 +422,8 @@ pub struct MarkdownEditor<'a> {
     id: Option<egui::Id>,
     /// Line number to scroll to (1-indexed, from outline navigation)
     scroll_to_line: Option<usize>,
+    /// Pending scroll offset to apply (for sync scrolling on mode switch)
+    pending_scroll_offset: Option<f32>,
 }
 
 impl<'a> MarkdownEditor<'a> {
@@ -417,6 +438,7 @@ impl<'a> MarkdownEditor<'a> {
             theme: Theme::Light,
             id: None,
             scroll_to_line: None,
+            pending_scroll_offset: None,
         }
     }
 
@@ -466,6 +488,13 @@ impl<'a> MarkdownEditor<'a> {
     #[must_use]
     pub fn scroll_to_line(mut self, line: Option<usize>) -> Self {
         self.scroll_to_line = line;
+        self
+    }
+
+    /// Set a pending scroll offset to apply (for sync scrolling on mode switch).
+    #[must_use]
+    pub fn pending_scroll_offset(mut self, offset: Option<f32>) -> Self {
+        self.pending_scroll_offset = offset;
         self
     }
 
@@ -554,6 +583,9 @@ impl<'a> MarkdownEditor<'a> {
             mode: EditorMode::Raw,
             focused_element: None, // Raw mode doesn't use element tracking
             scroll_offset: scroll_output.state.offset.y,
+            content_height: scroll_output.content_size.y,
+            viewport_height: scroll_output.inner_rect.height(),
+            line_mappings: Vec::new(), // Raw mode doesn't need line mappings
         }
     }
 
@@ -578,6 +610,10 @@ impl<'a> MarkdownEditor<'a> {
             }
         };
 
+        // DEBUG: Document structure logging removed - was too verbose (every frame)
+        // Enable manually if needed for debugging:
+        // debug!("[LIST_DEBUG] Document has {} top-level nodes", doc.root.children.len());
+
         // Calculate scroll offset for outline navigation if needed
         let target_scroll_offset: Option<f32> = if let Some(target_line) = self.scroll_to_line {
             let font_id = FontId::new(
@@ -599,8 +635,13 @@ impl<'a> MarkdownEditor<'a> {
             .id_source(id.with("rendered_scroll"))
             .auto_shrink([false, false]);
 
-        // Apply scroll offset if we need to jump to a line
-        if let Some(offset) = target_scroll_offset {
+        // Priority: Apply pending scroll offset from mode switch first
+        if let Some(offset) = self.pending_scroll_offset {
+            scroll_area = scroll_area.vertical_scroll_offset(offset);
+            log::debug!("Applied pending scroll offset in rendered mode: {}", offset);
+        }
+        // Otherwise, apply scroll offset if we need to jump to a line
+        else if let Some(offset) = target_scroll_offset {
             scroll_area = scroll_area.vertical_scroll_offset(offset);
         }
 
@@ -616,6 +657,9 @@ impl<'a> MarkdownEditor<'a> {
             hasher.finish()
         };
 
+        // Collect line mappings during render for scroll sync
+        let mut line_mappings: Vec<LineMapping> = Vec::new();
+        
         let scroll_output = scroll_area.show(ui, |ui| {
             // Push the content hash as an ID scope so all inner widgets
             // get unique IDs when content changes
@@ -627,6 +671,9 @@ impl<'a> MarkdownEditor<'a> {
                 // Note: Using original render_node (not the structural_keys version) since
                 // structural key handling is currently disabled due to compatibility issues
                 for node in &doc.root.children {
+                    // Capture Y position before rendering this node for scroll sync
+                    let y_before = ui.cursor().top();
+                    
                     render_node(
                         ui,
                         node,
@@ -637,6 +684,13 @@ impl<'a> MarkdownEditor<'a> {
                         self.font_family,
                         0,
                     );
+                    
+                    // Record the line mapping for this top-level node
+                    line_mappings.push(LineMapping {
+                        start_line: node.start_line,
+                        end_line: node.end_line,
+                        rendered_y: y_before,
+                    });
                 }
 
                 // Keep structural_state alive to avoid unused variable warning
@@ -680,6 +734,9 @@ impl<'a> MarkdownEditor<'a> {
             mode: EditorMode::Rendered,
             focused_element,
             scroll_offset: scroll_output.state.offset.y,
+            content_height: scroll_output.content_size.y,
+            viewport_height: scroll_output.inner_rect.height(),
+            line_mappings,
         }
     }
 }
@@ -1032,12 +1089,30 @@ fn render_heading(
     ui.add_space(top_margin);
 
     // Editable heading text with left indent
-    let (has_focus, selection, changed, new_text) = ui
+    // Create explicit ID for heading TextEdit to prevent any potential conflicts
+    let heading_widget_id = ui.id().with("heading_text").with(node.start_line);
+    let heading_edit_buffer_id = ui.id().with("heading_edit_buffer").with(node.start_line);
+    let heading_edit_tracking_id = ui.id().with("heading_edit_tracking").with(node.start_line);
+    
+    // Track whether this heading was previously focused (to detect focus loss)
+    let was_editing = ui.memory(|mem| {
+        mem.data.get_temp::<bool>(heading_edit_tracking_id).unwrap_or(false)
+    });
+
+    let (has_focus, selection) = ui
         .horizontal(|ui| {
             ui.add_space(4.0); // Small left indent for headings
 
             if let Some(editable) = edit_state.get_node_mut(node_id) {
-                let text_edit = TextEdit::singleline(&mut editable.text)
+                // Get or initialize the edit buffer from egui memory
+                let mut edit_buffer = ui.memory_mut(|mem| {
+                    mem.data
+                        .get_temp_mut_or_insert_with(heading_edit_buffer_id, || editable.text.clone())
+                        .clone()
+                });
+                
+                let text_edit = TextEdit::singleline(&mut edit_buffer)
+                    .id(heading_widget_id)
                     .font(FontId::new(font_size, font_family))
                     .text_color(colors.heading)
                     .frame(false)
@@ -1045,7 +1120,6 @@ fn render_heading(
 
                 let output = text_edit.show(ui);
 
-                let changed = output.response.changed();
                 let has_focus = output.response.has_focus();
                 let selection = if has_focus {
                     output.cursor_range.map(|range| {
@@ -1061,26 +1135,29 @@ fn render_heading(
                     None
                 };
 
-                let new_text = if changed {
-                    editable.modified = true;
-                    Some(editable.text.clone())
-                } else {
-                    None
-                };
+                // Update edit buffer and tracking in memory
+                ui.memory_mut(|mem| {
+                    mem.data.insert_temp(heading_edit_buffer_id, edit_buffer.clone());
+                    mem.data.insert_temp(heading_edit_tracking_id, has_focus);
+                });
 
-                (has_focus, selection, changed, new_text)
+                // Only commit changes when focus is LOST (was editing, now not)
+                // This prevents rebuild during active editing
+                if was_editing && !has_focus {
+                    editable.modified = true;
+                    update_source_line(source, node.start_line, &format_heading(&edit_buffer, level));
+                    // Clear the edit buffer
+                    ui.memory_mut(|mem| {
+                        mem.data.remove::<String>(heading_edit_buffer_id);
+                    });
+                }
+
+                (has_focus, selection)
             } else {
-                (false, None, false, None)
+                (false, None)
             }
         })
         .inner;
-
-    // Update source if changed
-    if changed {
-        if let Some(text) = new_text {
-            update_source_line(source, node.start_line, &format_heading(&text, level));
-        }
-    }
 
     // Track focus
     if has_focus {
@@ -1126,12 +1203,30 @@ fn render_heading_with_structural_keys(
     ui.add_space(top_margin);
 
     // Editable heading text with left indent
+    // Create explicit ID for heading TextEdit to prevent any potential conflicts
+    let heading_widget_id = ui.id().with("heading_text_sk").with(node.start_line);
+    let heading_edit_buffer_id = ui.id().with("heading_sk_edit_buffer").with(node.start_line);
+    let heading_edit_tracking_id = ui.id().with("heading_sk_edit_tracking").with(node.start_line);
+    
+    // Track whether this heading was previously focused
+    let was_editing = ui.memory(|mem| {
+        mem.data.get_temp::<bool>(heading_edit_tracking_id).unwrap_or(false)
+    });
+
     ui.horizontal(|ui| {
         ui.add_space(4.0);
 
         if let Some(editable) = edit_state.get_node_mut(node_id) {
+            // Get or initialize the edit buffer from egui memory
+            let mut edit_buffer = ui.memory_mut(|mem| {
+                mem.data
+                    .get_temp_mut_or_insert_with(heading_edit_buffer_id, || editable.text.clone())
+                    .clone()
+            });
+            
             let response = ui.add(
-                TextEdit::singleline(&mut editable.text)
+                TextEdit::singleline(&mut edit_buffer)
+                    .id(heading_widget_id)
                     .font(FontId::new(font_size, font_family))
                     .text_color(colors.heading)
                     .frame(false)
@@ -1139,17 +1234,24 @@ fn render_heading_with_structural_keys(
             );
 
             // Note: Structural key handling disabled for now to fix editing bugs
-            // TODO(deferred): Re-enable with proper key event handling
-            // The ast_ops module provides Enter/Tab/Backspace handling for WYSIWYG mode
             let _ = structural_state;
+            
+            let has_focus = response.has_focus();
+            
+            // Update edit buffer and tracking in memory
+            ui.memory_mut(|mem| {
+                mem.data.insert_temp(heading_edit_buffer_id, edit_buffer.clone());
+                mem.data.insert_temp(heading_edit_tracking_id, has_focus);
+            });
 
-            if response.changed() {
+            // Only commit when focus is lost
+            if was_editing && !has_focus {
                 editable.modified = true;
-                update_source_line(
-                    source,
-                    node.start_line,
-                    &format_heading(&editable.text, level),
-                );
+                update_source_line(source, node.start_line, &format_heading(&edit_buffer, level));
+                // Clear the edit buffer
+                ui.memory_mut(|mem| {
+                    mem.data.remove::<String>(heading_edit_buffer_id);
+                });
             }
         }
     });
@@ -1399,6 +1501,11 @@ fn render_list_with_structural_keys(
     indent_level: usize,
     list_type: &ListType,
 ) {
+    // Add small top margin for top-level lists
+    if indent_level == 0 {
+        ui.add_space(4.0);
+    }
+
     let mut item_number = match list_type {
         ListType::Ordered { start, .. } => *start,
         ListType::Bullet => 0,
@@ -1442,7 +1549,7 @@ fn render_list_item_with_structural_keys(
     indent_level: usize,
     list_type: &ListType,
     item_number: u32,
-    _item_index: usize,
+    item_index: usize,
 ) {
     let is_task = node
         .children
@@ -1519,9 +1626,6 @@ fn render_list_item_with_structural_keys(
     let indent_width = indent_level as f32 * 20.0;
     let font_family = fonts::get_styled_font_family(false, false, editor_font);
 
-    // For formatted items, create a unique ID for tracking edit state
-    let formatted_item_id = ui.id().with("formatted_list_item_sk").with(node.start_line);
-
     ui.horizontal(|ui| {
         ui.add_space(indent_width);
 
@@ -1563,6 +1667,15 @@ fn render_list_item_with_structural_keys(
         // Render item content
         if has_inline_formatting {
             if let Some(para) = para_node {
+                // Create unique ID using para.start_line (matches content extraction)
+                // AND item_index for additional uniqueness guarantee
+                // FIX: Previously used node.start_line which could differ from para.start_line
+                let formatted_item_id = ui
+                    .id()
+                    .with("formatted_list_item_sk")
+                    .with(para.start_line)
+                    .with(item_index);
+
                 // Get or create edit state for this formatted item
                 let mut item_edit_state = ui.memory_mut(|mem| {
                     mem.data
@@ -1669,15 +1782,24 @@ fn render_list_item_with_structural_keys(
                     );
 
                     if sense_response.clicked() {
+                        // DEBUG: Log click on structural key list item
+                        debug!(
+                            "[LIST_DEBUG] CLICK DETECTED (sk): para.start_line={}, item_index={}, \
+                             display_rect={:?}",
+                            para.start_line, item_index, display_response.rect
+                        );
+
                         // Enter edit mode
                         item_edit_state.editing = true;
                         item_edit_state.needs_focus = true;
                         // Get raw markdown content from source
                         item_edit_state.edit_text =
                             extract_list_item_content(source, para.start_line);
+
+                        // DEBUG: Log edit mode entry
                         debug!(
-                            "Entering edit mode for formatted list item at line {}, content: '{}'",
-                            para.start_line, item_edit_state.edit_text
+                            "[LIST_DEBUG] EDIT MODE ENTERED (sk): ID uses para.start_line={}, item_index={}, content='{}'",
+                            para.start_line, item_index, item_edit_state.edit_text
                         );
 
                         // Store the new state
@@ -2188,6 +2310,9 @@ fn render_inline_node(
 }
 
 /// Render a code block as an editable widget with syntax highlighting and language selection.
+///
+/// This function detects mermaid code blocks and routes them to the specialized
+/// mermaid rendering widget for diagram visualization.
 fn render_code_block(
     ui: &mut Ui,
     source: &mut String,
@@ -2198,6 +2323,13 @@ fn render_code_block(
     literal: &str,
     node: &MarkdownNode,
 ) {
+    // Check if this is a mermaid diagram block
+    // Mermaid blocks get special rendering with diagram type detection
+    if language.eq_ignore_ascii_case("mermaid") {
+        render_mermaid_block(ui, source, edit_state, colors, font_size, literal, node);
+        return;
+    }
+
     // Determine if we're in dark mode based on the background color
     let dark_mode = colors.background.r() < 128;
 
@@ -2269,6 +2401,84 @@ fn render_code_block(
     }
 }
 
+/// Render a mermaid diagram block with specialized visualization.
+///
+/// Mermaid blocks are detected by the `mermaid` language tag and rendered
+/// with diagram type indicators and styled source view. This provides better
+/// UX than treating them as regular code blocks.
+///
+/// # Features
+/// - Automatic diagram type detection (flowchart, sequence, class, etc.)
+/// - Visual indicator showing the diagram type
+/// - Syntax-highlighted source code view
+/// - Distinct styling to differentiate from regular code blocks
+///
+/// # Future Enhancements
+/// - SVG rendering via kroki.io API integration
+/// - Caching of rendered diagrams
+/// - Real-time preview updates
+fn render_mermaid_block(
+    ui: &mut Ui,
+    _source: &mut String,
+    _edit_state: &mut EditState,
+    colors: &EditorColors,
+    font_size: f32,
+    literal: &str,
+    node: &MarkdownNode,
+) {
+    // Determine if we're in dark mode based on the background color
+    let dark_mode = colors.background.r() < 128;
+
+    // Create a stable ID for this mermaid block using position info
+    let mermaid_block_id = egui::Id::new(("mermaid_block", node.start_line));
+
+    // Convert EditorColors to WidgetColors for the mermaid widget
+    let widget_colors = WidgetColors {
+        text: colors.text,
+        heading: colors.heading,
+        code_bg: colors.code_bg,
+        list_marker: colors.list_marker,
+        muted: colors.quote_text,
+    };
+
+    // Store the mermaid block data in egui's memory so it persists across frames
+    let mut mermaid_data = ui.memory_mut(|mem| {
+        mem.data
+            .get_temp_mut_or_insert_with(mermaid_block_id.with("state"), || {
+                MermaidBlockData::new(literal)
+            })
+            .clone()
+    });
+
+    // Check if the source content has changed (e.g., edited in raw mode)
+    // If so, update the cached data to match the current parsed content.
+    if mermaid_data.source != literal {
+        mermaid_data = MermaidBlockData::new(literal);
+    }
+
+    // Create and show the mermaid block widget
+    let output = MermaidBlock::new(&mut mermaid_data)
+        .font_size(font_size)
+        .dark_mode(dark_mode)
+        .colors(widget_colors)
+        .id(mermaid_block_id)
+        .show(ui);
+
+    // Update stored data
+    ui.memory_mut(|mem| {
+        mem.data
+            .insert_temp(mermaid_block_id.with("state"), mermaid_data);
+    });
+
+    // Log if changes were detected (for debugging)
+    if output.changed {
+        debug!(
+            "Mermaid block at line {} detected change (type: {:?})",
+            node.start_line, output.diagram_type
+        );
+    }
+}
+
 /// Render a block quote.
 fn render_blockquote(
     ui: &mut Ui,
@@ -2317,13 +2527,20 @@ fn render_list(
     indent_level: usize,
     list_type: &ListType,
 ) {
+    // Add small top margin for top-level lists to separate from preceding content
+    // This helps ensure clicks on the first list item don't accidentally hit the element above
+    if indent_level == 0 {
+        ui.add_space(4.0);
+    }
+
     let mut item_number = match list_type {
         ListType::Ordered { start, .. } => *start,
         ListType::Bullet => 0,
     };
 
-    for child in &node.children {
+    for (child_idx, child) in node.children.iter().enumerate() {
         if let MarkdownNodeType::Item = &child.node_type {
+            let _ = child_idx; // Suppress unused warning
             render_list_item(
                 ui,
                 child,
@@ -2475,9 +2692,6 @@ fn render_list_item(
     let indent_width = indent_level as f32 * 20.0;
     let font_family = fonts::get_styled_font_family(false, false, editor_font);
 
-    // For formatted items, create a unique ID for tracking edit state
-    let formatted_item_id = ui.id().with("formatted_list_item").with(node.start_line);
-
     let focus_info: (bool, Option<(usize, usize)>, Option<usize>) = ui.horizontal(|ui| {
         // Indentation
         ui.add_space(indent_width);
@@ -2524,6 +2738,15 @@ fn render_list_item(
         // Render item content
         if has_inline_formatting {
             if let Some(para) = para_node {
+                // Create unique ID using para.start_line (matches content extraction) 
+                // AND item_number for additional uniqueness guarantee
+                // FIX: Previously used node.start_line which could differ from para.start_line
+                let formatted_item_id = ui
+                    .id()
+                    .with("formatted_list_item")
+                    .with(para.start_line)
+                    .with(item_number);
+
                 // Get or create edit state for this formatted item
                 let mut item_edit_state = ui.memory_mut(|mem| {
                     mem.data
@@ -2598,13 +2821,25 @@ fn render_list_item(
                     );
 
                     if sense_response.clicked() {
+                        // DEBUG: Log detailed click information
+                        debug!(
+                            "[LIST_DEBUG] CLICK DETECTED on list item: node.start_line={}, para.start_line={}, \
+                             display_rect={:?}, item_number={}",
+                            node.start_line, para.start_line, display_response.rect, item_number
+                        );
+
                         // Enter edit mode
                         item_edit_state.editing = true;
                         item_edit_state.needs_focus = true;
                         // Get raw markdown content from source
                         item_edit_state.edit_text = extract_list_item_content(source, para.start_line);
-                        debug!("Entering edit mode for formatted list item at line {}, content: '{}'",
-                               para.start_line, item_edit_state.edit_text);
+
+                        // DEBUG: Log the edit state being set
+                        debug!(
+                            "[LIST_DEBUG] EDIT MODE ENTERED: formatted_item_id uses node.start_line={}, \
+                             extracting content from para.start_line={}, content='{}'",
+                            node.start_line, para.start_line, item_edit_state.edit_text
+                        );
 
                         // Store the new state
                         ui.memory_mut(|mem| {
@@ -2620,10 +2855,27 @@ fn render_list_item(
             }
         } else if let Some((node_id, start_line, end_line)) = simple_text_node_id {
             // Simple text - editable
+            // Use egui memory to store the edit buffer so it persists across frames
+            let edit_buffer_id = ui.id().with("list_item_edit_buffer").with(start_line);
+            let edit_tracking_id = ui.id().with("list_item_edit_tracking").with(start_line);
+            
+            // Track whether this item was previously focused (to detect focus loss)
+            let was_editing = ui.memory(|mem| {
+                mem.data.get_temp::<bool>(edit_tracking_id).unwrap_or(false)
+            });
+            
             if let Some(editable) = edit_state.get_node_mut(node_id) {
+                // Get or initialize the edit buffer from egui memory
+                // If not editing yet, initialize from current text
+                let mut edit_buffer = ui.memory_mut(|mem| {
+                    mem.data
+                        .get_temp_mut_or_insert_with(edit_buffer_id, || editable.text.clone())
+                        .clone()
+                });
+                
                 let widget_id = ui.id().with("list_item_text").with(start_line);
 
-                let text_edit = TextEdit::singleline(&mut editable.text)
+                let text_edit = TextEdit::singleline(&mut edit_buffer)
                     .id(widget_id)
                     .font(FontId::new(font_size, font_family))
                     .text_color(colors.text)
@@ -2633,7 +2885,6 @@ fn render_list_item(
 
                 let output = text_edit.show(ui);
 
-                let changed = output.response.changed();
                 let has_focus = output.response.has_focus();
                 let selection = if has_focus {
                     output.cursor_range.map(|range| {
@@ -2649,9 +2900,22 @@ fn render_list_item(
                     None
                 };
 
-                if changed {
+                // Update edit buffer in memory
+                ui.memory_mut(|mem| {
+                    mem.data.insert_temp(edit_buffer_id, edit_buffer.clone());
+                    mem.data.insert_temp(edit_tracking_id, has_focus);
+                });
+
+                // Only commit changes when focus is LOST (was editing, now not)
+                // This prevents rebuild during active editing
+                if was_editing && !has_focus {
+                    // Commit the edit buffer to source
                     editable.modified = true;
-                    update_source_range(source, start_line, end_line, &editable.text);
+                    update_source_range(source, start_line, end_line, &edit_buffer);
+                    // Clear the edit buffer so next edit starts fresh
+                    ui.memory_mut(|mem| {
+                        mem.data.remove::<String>(edit_buffer_id);
+                    });
                 }
 
                 // Return focus info for tracking
