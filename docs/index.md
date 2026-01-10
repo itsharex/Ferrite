@@ -68,9 +68,15 @@ A fast, lightweight text editor for Markdown, JSON, and more. Built with Rust an
 | [Search Panel Viewport](./technical/search-panel-viewport.md) | Viewport constraints for Search panel, DPI handling, resize behavior |
 | [Ribbon Redesign](./technical/ribbon-redesign.md) | Design C streamlined ribbon, title bar integration, dropdown menus |
 | [Mermaid Diagrams](./technical/mermaid-diagrams.md) | MermaidJS code block detection, diagram type indicators, styled rendering |
+| [Mermaid Text Measurement](./technical/mermaid-text-measurement.md) | TextMeasurer trait, dynamic node sizing, egui font metrics integration |
+| [Sequence Control Blocks](./technical/sequence-control-blocks.md) | Sequence diagram loop/alt/opt/par blocks, nested parsing, block rendering |
+| [Flowchart Layout Algorithm](./technical/flowchart-layout-algorithm.md) | Sugiyama-style layered graph layout, cycle detection, crossing reduction |
+| [Flowchart Subgraphs](./technical/flowchart-subgraphs.md) | Flowchart subgraph support, nested parsing, bounding box computation |
+| [Sequence Activations & Notes](./technical/sequence-activations-notes.md) | Activation boxes, notes, +/- shorthand, state tracking |
 | [Editor Minimap](./technical/minimap.md) | VS Code-style minimap navigation, click-to-navigate, search highlights, split view support |
 | [Branding](./branding.md) | Icon design, asset generation, platform integration guidelines |
 | **[Custom Editor Widget Plan](./technical/custom-editor-widget-plan.md)** | **v0.3.0 planning: Replace egui TextEdit with custom FerriteEditor widget** |
+| **[Mermaid Crate Plan](./mermaid-crate-plan.md)** | **Extract Mermaid renderer as standalone pure-Rust crate** |
 
 ---
 

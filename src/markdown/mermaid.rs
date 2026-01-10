@@ -17,17 +17,170 @@
 //! # Example
 //!
 //! ```ignore
-//! use crate::markdown::mermaid::{parse_flowchart, layout_flowchart, render_flowchart};
+//! use crate::markdown::mermaid::{parse_flowchart, layout_flowchart, render_flowchart, EguiTextMeasurer};
 //!
 //! let source = "flowchart TD\n  A[Start] --> B[End]";
 //! if let Ok(flowchart) = parse_flowchart(source) {
-//!     let layout = layout_flowchart(&flowchart, available_width);
-//!     render_flowchart(ui, &flowchart, &layout, colors);
+//!     let text_measurer = EguiTextMeasurer::new(ui);
+//!     let layout = layout_flowchart(&flowchart, available_width, font_size, &text_measurer);
+//!     render_flowchart(ui, &flowchart, &layout, colors, font_size);
 //! }
 //! ```
 
 use egui::{Color32, FontId, Pos2, Rect, Rounding, Stroke, Ui, Vec2};
 use std::collections::HashMap;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Text Measurement
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Result of measuring text dimensions.
+#[derive(Debug, Clone, Copy)]
+pub struct TextSize {
+    pub width: f32,
+    pub height: f32,
+}
+
+impl TextSize {
+    pub fn new(width: f32, height: f32) -> Self {
+        Self { width, height }
+    }
+}
+
+/// Trait for measuring text dimensions.
+///
+/// This enables backend-agnostic text measurement, supporting future
+/// SVG/PNG backends when extracting to a standalone crate.
+pub trait TextMeasurer {
+    /// Measure the dimensions of text with the given font size.
+    fn measure(&self, text: &str, font_size: f32) -> TextSize;
+
+    /// Get the row height for a font at the given size.
+    fn row_height(&self, font_size: f32) -> f32;
+
+    /// Measure text with wrapping at max_width. Returns size of wrapped text.
+    fn measure_wrapped(&self, text: &str, font_size: f32, max_width: f32) -> TextSize {
+        let single_line = self.measure(text, font_size);
+        if single_line.width <= max_width || max_width <= 0.0 {
+            return single_line;
+        }
+
+        // Estimate wrapped height based on number of lines needed
+        let lines_needed = (single_line.width / max_width).ceil();
+        TextSize::new(max_width, single_line.height * lines_needed)
+    }
+
+    /// Truncate text to fit within max_width, adding ellipsis if needed.
+    fn truncate_with_ellipsis(&self, text: &str, font_size: f32, max_width: f32) -> String {
+        let size = self.measure(text, font_size);
+        if size.width <= max_width || max_width <= 0.0 {
+            return text.to_string();
+        }
+
+        let ellipsis = "…";
+        let ellipsis_width = self.measure(ellipsis, font_size).width;
+        let available_width = max_width - ellipsis_width;
+
+        if available_width <= 0.0 {
+            return ellipsis.to_string();
+        }
+
+        // Binary search for the right truncation point
+        let chars: Vec<char> = text.chars().collect();
+        let mut low = 0;
+        let mut high = chars.len();
+
+        while low < high {
+            let mid = (low + high + 1) / 2;
+            let truncated: String = chars[..mid].iter().collect();
+            let width = self.measure(&truncated, font_size).width;
+
+            if width <= available_width {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+
+        if low == 0 {
+            ellipsis.to_string()
+        } else {
+            let truncated: String = chars[..low].iter().collect();
+            format!("{}{}", truncated, ellipsis)
+        }
+    }
+}
+
+/// Text measurer implementation using egui's font system.
+pub struct EguiTextMeasurer<'a> {
+    ui: &'a Ui,
+}
+
+impl<'a> EguiTextMeasurer<'a> {
+    pub fn new(ui: &'a Ui) -> Self {
+        Self { ui }
+    }
+}
+
+impl TextMeasurer for EguiTextMeasurer<'_> {
+    fn measure(&self, text: &str, font_size: f32) -> TextSize {
+        let font_id = FontId::proportional(font_size);
+        let galley = self.ui.fonts(|fonts| {
+            fonts.layout_no_wrap(text.to_string(), font_id, Color32::PLACEHOLDER)
+        });
+        TextSize::new(galley.rect.width(), galley.rect.height())
+    }
+
+    fn row_height(&self, font_size: f32) -> f32 {
+        let font_id = FontId::proportional(font_size);
+        self.ui.fonts(|fonts| fonts.row_height(&font_id))
+    }
+
+    fn measure_wrapped(&self, text: &str, font_size: f32, max_width: f32) -> TextSize {
+        if max_width <= 0.0 {
+            return self.measure(text, font_size);
+        }
+
+        let font_id = FontId::proportional(font_size);
+        let galley = self.ui.fonts(|fonts| {
+            let layout_job = egui::text::LayoutJob::simple(
+                text.to_string(),
+                font_id,
+                Color32::PLACEHOLDER,
+                max_width,
+            );
+            fonts.layout_job(layout_job)
+        });
+        TextSize::new(galley.rect.width(), galley.rect.height())
+    }
+}
+
+/// Fallback text measurer using character-based estimation.
+/// Used when egui context is not available (e.g., in tests).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EstimatedTextMeasurer {
+    /// Approximate width per character as a fraction of font size.
+    char_width_factor: f32,
+}
+
+impl EstimatedTextMeasurer {
+    pub fn new() -> Self {
+        Self {
+            char_width_factor: 0.55, // Slightly better than the old 0.6
+        }
+    }
+}
+
+impl TextMeasurer for EstimatedTextMeasurer {
+    fn measure(&self, text: &str, font_size: f32) -> TextSize {
+        let width = text.len() as f32 * font_size * self.char_width_factor;
+        TextSize::new(width, font_size)
+    }
+
+    fn row_height(&self, font_size: f32) -> f32 {
+        font_size * 1.2 // Standard line height
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Flowchart AST Types
@@ -97,12 +250,30 @@ pub struct FlowEdge {
     pub arrow_end: ArrowHead,
 }
 
+/// A subgraph (cluster) in a flowchart.
+#[derive(Debug, Clone)]
+pub struct FlowSubgraph {
+    /// Unique identifier for the subgraph
+    pub id: String,
+    /// Display title (may differ from id)
+    pub title: Option<String>,
+    /// IDs of nodes directly contained in this subgraph
+    pub node_ids: Vec<String>,
+    /// IDs of nested subgraphs
+    pub child_subgraph_ids: Vec<String>,
+    /// Optional direction override for this subgraph (for future use)
+    #[allow(dead_code)]
+    pub direction: Option<FlowDirection>,
+}
+
 /// A parsed flowchart.
 #[derive(Debug, Clone, Default)]
 pub struct Flowchart {
     pub direction: FlowDirection,
     pub nodes: Vec<FlowNode>,
     pub edges: Vec<FlowEdge>,
+    /// Subgraphs in the flowchart (order matters for rendering - parents before children)
+    pub subgraphs: Vec<FlowSubgraph>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -112,13 +283,16 @@ pub struct Flowchart {
 /// Parse mermaid flowchart source into a Flowchart AST.
 pub fn parse_flowchart(source: &str) -> Result<Flowchart, String> {
     let mut flowchart = Flowchart::default();
-    let mut lines = source.lines().peekable();
+    let lines: Vec<&str> = source.lines().collect();
     let mut node_map: HashMap<String, usize> = HashMap::new();
+    let mut line_idx = 0;
 
     // Parse header line (skip comments and empty lines)
     let mut found_header = false;
-    while let Some(header) = lines.next() {
-        let header_trimmed = header.trim();
+    while line_idx < lines.len() {
+        let header_trimmed = lines[line_idx].trim();
+        line_idx += 1;
+        
         // Skip empty lines and comments
         if header_trimmed.is_empty() || header_trimmed.starts_with("%%") {
             continue;
@@ -137,12 +311,62 @@ pub fn parse_flowchart(source: &str) -> Result<Flowchart, String> {
         return Err("Empty flowchart source".to_string());
     }
 
-    // Parse body lines
-    for line in lines {
-        let line = line.trim();
+    // Parse body with subgraph support
+    let mut subgraph_stack: Vec<SubgraphBuilder> = Vec::new();
+    let mut subgraph_counter = 0;
+    let mut subgraph_map: HashMap<String, usize> = HashMap::new();
+
+    while line_idx < lines.len() {
+        let line = lines[line_idx].trim();
+        line_idx += 1;
         
         // Skip empty lines and comments
         if line.is_empty() || line.starts_with("%%") {
+            continue;
+        }
+
+        let line_lower = line.to_lowercase();
+
+        // Check for subgraph start
+        if line_lower.starts_with("subgraph") {
+            let (id, title) = parse_subgraph_header(line, &mut subgraph_counter);
+            subgraph_stack.push(SubgraphBuilder {
+                id: id.clone(),
+                title,
+                node_ids: Vec::new(),
+                child_subgraph_ids: Vec::new(),
+                direction: None,
+            });
+            continue;
+        }
+
+        // Check for subgraph end
+        if line_lower == "end" {
+            if let Some(builder) = subgraph_stack.pop() {
+                let subgraph = FlowSubgraph {
+                    id: builder.id.clone(),
+                    title: builder.title,
+                    node_ids: builder.node_ids,
+                    child_subgraph_ids: builder.child_subgraph_ids,
+                    direction: builder.direction,
+                };
+                
+                // Register this subgraph as a child of the parent (if any)
+                if let Some(parent) = subgraph_stack.last_mut() {
+                    parent.child_subgraph_ids.push(builder.id.clone());
+                }
+                
+                subgraph_map.insert(builder.id, flowchart.subgraphs.len());
+                flowchart.subgraphs.push(subgraph);
+            }
+            continue;
+        }
+
+        // Check for direction override inside subgraph
+        if !subgraph_stack.is_empty() && line_lower.starts_with("direction") {
+            if let Some(current) = subgraph_stack.last_mut() {
+                current.direction = Some(parse_direction(&line_lower));
+            }
             continue;
         }
 
@@ -151,7 +375,12 @@ pub fn parse_flowchart(source: &str) -> Result<Flowchart, String> {
             for (id, label, shape) in nodes {
                 if !node_map.contains_key(&id) {
                     node_map.insert(id.clone(), flowchart.nodes.len());
-                    flowchart.nodes.push(FlowNode { id, label, shape });
+                    flowchart.nodes.push(FlowNode { id: id.clone(), label, shape });
+                    
+                    // Associate with current subgraph if any
+                    if let Some(current) = subgraph_stack.last_mut() {
+                        current.node_ids.push(id);
+                    }
                 }
             }
             if let Some(e) = edge {
@@ -160,13 +389,102 @@ pub fn parse_flowchart(source: &str) -> Result<Flowchart, String> {
         } else if let Some(node) = parse_node_definition(line) {
             // Standalone node definition
             if !node_map.contains_key(&node.id) {
-                node_map.insert(node.id.clone(), flowchart.nodes.len());
+                let id = node.id.clone();
+                node_map.insert(id.clone(), flowchart.nodes.len());
                 flowchart.nodes.push(node);
+                
+                // Associate with current subgraph if any
+                if let Some(current) = subgraph_stack.last_mut() {
+                    current.node_ids.push(id);
+                }
             }
         }
     }
 
+    // Handle any unclosed subgraphs (close them at end of diagram)
+    while let Some(builder) = subgraph_stack.pop() {
+        let subgraph = FlowSubgraph {
+            id: builder.id.clone(),
+            title: builder.title,
+            node_ids: builder.node_ids,
+            child_subgraph_ids: builder.child_subgraph_ids,
+            direction: builder.direction,
+        };
+        
+        if let Some(parent) = subgraph_stack.last_mut() {
+            parent.child_subgraph_ids.push(builder.id.clone());
+        }
+        
+        flowchart.subgraphs.push(subgraph);
+    }
+
     Ok(flowchart)
+}
+
+/// Helper struct for building subgraphs during parsing.
+struct SubgraphBuilder {
+    id: String,
+    title: Option<String>,
+    node_ids: Vec<String>,
+    child_subgraph_ids: Vec<String>,
+    direction: Option<FlowDirection>,
+}
+
+/// Parse subgraph header line to extract id and title.
+/// Supports: `subgraph title` and `subgraph id [title]`
+fn parse_subgraph_header(line: &str, counter: &mut usize) -> (String, Option<String>) {
+    let rest = line.trim_start_matches(|c: char| c.is_ascii_alphabetic())
+        .trim_start(); // Remove "subgraph" and leading whitespace
+    
+    if rest.is_empty() {
+        // No id or title, generate id
+        *counter += 1;
+        return (format!("subgraph_{}", counter), None);
+    }
+
+    // Check if rest contains brackets (explicit title)
+    if let Some(bracket_start) = rest.find('[') {
+        if let Some(bracket_end) = rest.rfind(']') {
+            let id = rest[..bracket_start].trim().to_string();
+            let title = rest[bracket_start + 1..bracket_end].trim().to_string();
+            let id = if id.is_empty() {
+                *counter += 1;
+                format!("subgraph_{}", counter)
+            } else {
+                id
+            };
+            return (id, Some(title));
+        }
+    }
+
+    // Check for quoted title
+    if rest.starts_with('"') || rest.starts_with('\'') {
+        let quote = rest.chars().next().unwrap();
+        if let Some(end_quote) = rest[1..].find(quote) {
+            let title = rest[1..end_quote + 1].to_string();
+            *counter += 1;
+            return (format!("subgraph_{}", counter), Some(title));
+        }
+    }
+
+    // Check if first token looks like an ID (alphanumeric, no spaces)
+    let tokens: Vec<&str> = rest.split_whitespace().collect();
+    if tokens.len() == 1 {
+        // Single token - could be ID or title
+        // If it contains spaces when trimmed differently, it's a title
+        // Otherwise treat as both ID and title
+        let token = tokens[0].to_string();
+        return (token.clone(), Some(token));
+    } else if tokens.len() >= 2 {
+        // First token is ID, rest is title
+        let id = tokens[0].to_string();
+        let title = tokens[1..].join(" ");
+        return (id, Some(title));
+    }
+
+    // Fallback: generate ID, use rest as title
+    *counter += 1;
+    (format!("subgraph_{}", counter), Some(rest.to_string()))
 }
 
 fn parse_direction(header: &str) -> FlowDirection {
@@ -383,181 +701,648 @@ pub struct NodeLayout {
     pub size: Vec2,
 }
 
+/// Layout information for a subgraph.
+#[derive(Debug, Clone)]
+pub struct SubgraphLayout {
+    /// Bounding box position (top-left corner)
+    pub pos: Pos2,
+    /// Bounding box size
+    pub size: Vec2,
+    /// Title to display (if any)
+    pub title: Option<String>,
+}
+
 /// Complete layout for a flowchart.
 #[derive(Debug, Clone, Default)]
 pub struct FlowchartLayout {
     pub nodes: HashMap<String, NodeLayout>,
+    pub subgraphs: HashMap<String, SubgraphLayout>,
     pub total_size: Vec2,
+    /// Set of back-edges (cycles): (from_node_id, to_node_id)
+    pub back_edges: std::collections::HashSet<(String, String)>,
 }
 
-/// Compute layout for a flowchart.
-pub fn layout_flowchart(flowchart: &Flowchart, available_width: f32, font_size: f32) -> FlowchartLayout {
+/// Compute layout for a flowchart using a Sugiyama-style layered graph algorithm.
+///
+/// This algorithm supports:
+/// - Proper branching with side-by-side node placement
+/// - Cycle detection and back-edge handling
+/// - Edge crossing minimization using barycenter heuristic
+/// - Subgraph bounding boxes with padding
+/// - All flow directions (TD, BT, LR, RL)
+///
+/// The `text_measurer` parameter enables accurate text sizing. Use `EguiTextMeasurer`
+/// when a UI context is available, or `EstimatedTextMeasurer` for testing.
+pub fn layout_flowchart(
+    flowchart: &Flowchart,
+    available_width: f32,
+    font_size: f32,
+    text_measurer: &impl TextMeasurer,
+) -> FlowchartLayout {
     if flowchart.nodes.is_empty() {
         return FlowchartLayout::default();
     }
 
-    let node_padding = Vec2::new(24.0, 12.0);
-    let node_spacing = Vec2::new(40.0, 50.0);
-    
-    // Calculate node sizes based on text
-    let mut node_sizes: HashMap<String, Vec2> = HashMap::new();
-    for node in &flowchart.nodes {
-        let text_width = node.label.len() as f32 * font_size * 0.6;
-        let text_height = font_size;
-        let size = Vec2::new(
-            (text_width + node_padding.x * 2.0).max(80.0),
-            (text_height + node_padding.y * 2.0).max(40.0),
-        );
-        node_sizes.insert(node.id.clone(), size);
-    }
+    // Layout configuration
+    let config = FlowLayoutConfig {
+        node_padding: Vec2::new(24.0, 12.0),
+        node_spacing: Vec2::new(50.0, 60.0),
+        max_node_width: (available_width * 0.4).max(150.0),
+        text_width_factor: 1.15,
+        margin: 20.0,
+        crossing_reduction_iterations: 4,
+        subgraph_padding: 15.0,
+        subgraph_title_height: 24.0,
+    };
 
-    // Build adjacency for layer assignment
-    let mut outgoing: HashMap<String, Vec<String>> = HashMap::new();
-    let mut incoming: HashMap<String, Vec<String>> = HashMap::new();
-    
-    for node in &flowchart.nodes {
-        outgoing.insert(node.id.clone(), Vec::new());
-        incoming.insert(node.id.clone(), Vec::new());
-    }
-    
-    for edge in &flowchart.edges {
-        if let Some(out) = outgoing.get_mut(&edge.from) {
-            out.push(edge.to.clone());
+    // Build internal graph representation
+    let graph = FlowGraph::from_flowchart(flowchart, font_size, text_measurer, &config);
+
+    // Run the Sugiyama layout algorithm
+    let sugiyama = SugiyamaLayout::new(graph, flowchart.direction, config.clone(), available_width);
+    let mut layout = sugiyama.compute();
+
+    // Compute subgraph bounding boxes
+    compute_subgraph_layouts(&mut layout, flowchart, &config);
+
+    layout
+}
+
+/// Compute bounding boxes for all subgraphs based on positioned nodes.
+fn compute_subgraph_layouts(
+    layout: &mut FlowchartLayout,
+    flowchart: &Flowchart,
+    config: &FlowLayoutConfig,
+) {
+    // Process subgraphs in reverse order (children before parents for nested bounds)
+    // But store results keyed by ID so we can look up child bounds
+    let mut subgraph_bounds: HashMap<String, (Pos2, Pos2)> = HashMap::new();
+
+    for subgraph in flowchart.subgraphs.iter().rev() {
+        let mut min_x = f32::MAX;
+        let mut min_y = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut max_y = f32::MIN;
+        let mut has_content = false;
+
+        // Include direct node members
+        for node_id in &subgraph.node_ids {
+            if let Some(node_layout) = layout.nodes.get(node_id) {
+                min_x = min_x.min(node_layout.pos.x);
+                min_y = min_y.min(node_layout.pos.y);
+                max_x = max_x.max(node_layout.pos.x + node_layout.size.x);
+                max_y = max_y.max(node_layout.pos.y + node_layout.size.y);
+                has_content = true;
+            }
         }
-        if let Some(inc) = incoming.get_mut(&edge.to) {
-            inc.push(edge.from.clone());
+
+        // Include nested subgraph bounds
+        for child_id in &subgraph.child_subgraph_ids {
+            if let Some(&(child_min, child_max)) = subgraph_bounds.get(child_id) {
+                min_x = min_x.min(child_min.x);
+                min_y = min_y.min(child_min.y);
+                max_x = max_x.max(child_max.x);
+                max_y = max_y.max(child_max.y);
+                has_content = true;
+            }
+        }
+
+        if has_content {
+            // Add padding around content
+            let padded_min = Pos2::new(
+                min_x - config.subgraph_padding,
+                min_y - config.subgraph_padding - config.subgraph_title_height,
+            );
+            let padded_max = Pos2::new(
+                max_x + config.subgraph_padding,
+                max_y + config.subgraph_padding,
+            );
+
+            subgraph_bounds.insert(subgraph.id.clone(), (padded_min, padded_max));
+
+            let size = Vec2::new(padded_max.x - padded_min.x, padded_max.y - padded_min.y);
+            layout.subgraphs.insert(
+                subgraph.id.clone(),
+                SubgraphLayout {
+                    pos: padded_min,
+                    size,
+                    title: subgraph.title.clone(),
+                },
+            );
         }
     }
 
-    // Assign layers using topological sort
-    let mut layers: Vec<Vec<String>> = Vec::new();
-    let mut node_layer: HashMap<String, usize> = HashMap::new();
-    let mut remaining: Vec<String> = flowchart.nodes.iter().map(|n| n.id.clone()).collect();
+    // Update total_size to account for subgraph bounds
+    for sg_layout in layout.subgraphs.values() {
+        layout.total_size.x = layout.total_size.x.max(sg_layout.pos.x + sg_layout.size.x + config.margin);
+        layout.total_size.y = layout.total_size.y.max(sg_layout.pos.y + sg_layout.size.y + config.margin);
+    }
+}
 
-    while !remaining.is_empty() {
-        // Find nodes with no remaining incoming edges
-        let layer_nodes: Vec<String> = remaining
-            .iter()
-            .filter(|id| {
-                incoming.get(*id).map_or(true, |inc| {
-                    inc.iter().all(|from| node_layer.contains_key(from))
-                })
-            })
-            .cloned()
+/// Configuration for flowchart layout.
+#[derive(Debug, Clone)]
+struct FlowLayoutConfig {
+    node_padding: Vec2,
+    node_spacing: Vec2,
+    max_node_width: f32,
+    text_width_factor: f32,
+    margin: f32,
+    crossing_reduction_iterations: usize,
+    /// Padding around subgraph content
+    subgraph_padding: f32,
+    /// Height reserved for subgraph title
+    subgraph_title_height: f32,
+}
+
+/// Internal graph representation for layout algorithms.
+#[derive(Debug)]
+struct FlowGraph {
+    /// Node IDs in order
+    node_ids: Vec<String>,
+    /// Map from node ID to index (kept for potential future edge routing enhancements)
+    #[allow(dead_code)]
+    id_to_index: HashMap<String, usize>,
+    /// Node sizes (indexed by node index)
+    node_sizes: Vec<Vec2>,
+    /// Outgoing edges: node_index -> Vec<target_index>
+    outgoing: Vec<Vec<usize>>,
+    /// Incoming edges: node_index -> Vec<source_index>
+    incoming: Vec<Vec<usize>>,
+    /// Back-edges detected during cycle breaking (source, target)
+    back_edges: Vec<(usize, usize)>,
+}
+
+impl FlowGraph {
+    /// Build graph from flowchart AST with text measurement.
+    fn from_flowchart(
+        flowchart: &Flowchart,
+        font_size: f32,
+        text_measurer: &impl TextMeasurer,
+        config: &FlowLayoutConfig,
+    ) -> Self {
+        let n = flowchart.nodes.len();
+        let mut node_ids = Vec::with_capacity(n);
+        let mut id_to_index = HashMap::with_capacity(n);
+        let mut node_sizes = Vec::with_capacity(n);
+        let mut outgoing = vec![Vec::new(); n];
+        let mut incoming = vec![Vec::new(); n];
+
+        // Build node index mapping and compute sizes
+        for (idx, node) in flowchart.nodes.iter().enumerate() {
+            node_ids.push(node.id.clone());
+            id_to_index.insert(node.id.clone(), idx);
+
+            // Measure text and compute node size
+            let text_size = text_measurer.measure(&node.label, font_size);
+            let adjusted_width = text_size.width * config.text_width_factor;
+
+            let (text_width, text_height) = if adjusted_width + config.node_padding.x * 2.0 > config.max_node_width {
+                let wrap_width = config.max_node_width - config.node_padding.x * 2.0;
+                let wrapped = text_measurer.measure_wrapped(&node.label, font_size, wrap_width);
+                (wrapped.width * config.text_width_factor, wrapped.height)
+            } else {
+                (adjusted_width, text_size.height)
+            };
+
+            let size = Vec2::new(
+                (text_width + config.node_padding.x * 2.0).max(80.0),
+                (text_height + config.node_padding.y * 2.0).max(40.0),
+            );
+            node_sizes.push(size);
+        }
+
+        // Build adjacency lists
+        for edge in &flowchart.edges {
+            if let (Some(&from_idx), Some(&to_idx)) = (id_to_index.get(&edge.from), id_to_index.get(&edge.to)) {
+                outgoing[from_idx].push(to_idx);
+                incoming[to_idx].push(from_idx);
+            }
+        }
+
+        FlowGraph {
+            node_ids,
+            id_to_index,
+            node_sizes,
+            outgoing,
+            incoming,
+            back_edges: Vec::new(),
+        }
+    }
+
+    fn node_count(&self) -> usize {
+        self.node_ids.len()
+    }
+}
+
+/// Sugiyama-style layered graph layout algorithm.
+struct SugiyamaLayout {
+    graph: FlowGraph,
+    direction: FlowDirection,
+    config: FlowLayoutConfig,
+    available_width: f32,
+    /// Assigned layer for each node (indexed by node index)
+    node_layers: Vec<usize>,
+    /// Nodes in each layer, ordered for crossing minimization
+    layers: Vec<Vec<usize>>,
+}
+
+impl SugiyamaLayout {
+    fn new(
+        graph: FlowGraph,
+        direction: FlowDirection,
+        config: FlowLayoutConfig,
+        available_width: f32,
+    ) -> Self {
+        let n = graph.node_count();
+        SugiyamaLayout {
+            graph,
+            direction,
+            config,
+            available_width,
+            node_layers: vec![0; n],
+            layers: Vec::new(),
+        }
+    }
+
+    /// Run the complete layout algorithm.
+    fn compute(mut self) -> FlowchartLayout {
+        if self.graph.node_count() == 0 {
+            return FlowchartLayout::default();
+        }
+
+        // Step 1: Detect cycles and mark back-edges
+        self.detect_cycles_and_mark_back_edges();
+
+        // Step 2: Assign layers using longest-path algorithm
+        self.assign_layers();
+
+        // Step 3: Build initial layer structure
+        self.build_layers();
+
+        // Step 4: Reduce edge crossings
+        self.reduce_crossings();
+
+        // Step 5: Assign coordinates
+        self.assign_coordinates()
+    }
+
+    /// Detect cycles using DFS and mark back-edges.
+    /// Uses a simple DFS-based approach to find back-edges.
+    fn detect_cycles_and_mark_back_edges(&mut self) {
+        let n = self.graph.node_count();
+        let mut visited = vec![false; n];
+        let mut in_stack = vec![false; n];
+        let mut back_edges = Vec::new();
+
+        for start in 0..n {
+            if !visited[start] {
+                self.dfs_find_back_edges(start, &mut visited, &mut in_stack, &mut back_edges);
+            }
+        }
+
+        self.graph.back_edges = back_edges;
+    }
+
+    fn dfs_find_back_edges(
+        &self,
+        node: usize,
+        visited: &mut [bool],
+        in_stack: &mut [bool],
+        back_edges: &mut Vec<(usize, usize)>,
+    ) {
+        visited[node] = true;
+        in_stack[node] = true;
+
+        for &neighbor in &self.graph.outgoing[node] {
+            if !visited[neighbor] {
+                self.dfs_find_back_edges(neighbor, visited, in_stack, back_edges);
+            } else if in_stack[neighbor] {
+                // Found a back-edge (cycle)
+                back_edges.push((node, neighbor));
+            }
+        }
+
+        in_stack[node] = false;
+    }
+
+    /// Assign layers using longest-path algorithm.
+    /// Nodes with no incoming edges (ignoring back-edges) go to layer 0,
+    /// others are placed at max(predecessor_layer) + 1.
+    fn assign_layers(&mut self) {
+        let n = self.graph.node_count();
+        
+        // Build effective incoming edges (excluding back-edges)
+        let back_edge_set: std::collections::HashSet<(usize, usize)> = 
+            self.graph.back_edges.iter().cloned().collect();
+        
+        let mut effective_incoming: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (from_idx, targets) in self.graph.outgoing.iter().enumerate() {
+            for &to_idx in targets {
+                if !back_edge_set.contains(&(from_idx, to_idx)) {
+                    effective_incoming[to_idx].push(from_idx);
+                }
+            }
+        }
+
+        // Compute layers using longest-path (BFS-based topological approach)
+        let mut in_degree: Vec<usize> = effective_incoming.iter().map(|v| v.len()).collect();
+        let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+
+        // Start with nodes that have no incoming edges
+        for (idx, &deg) in in_degree.iter().enumerate() {
+            if deg == 0 {
+                queue.push_back(idx);
+                self.node_layers[idx] = 0;
+            }
+        }
+
+        // If no root nodes found (all nodes in cycles), pick the first node
+        if queue.is_empty() && n > 0 {
+            queue.push_back(0);
+            self.node_layers[0] = 0;
+            in_degree[0] = 0;
+        }
+
+        while let Some(node) = queue.pop_front() {
+            let current_layer = self.node_layers[node];
+            
+            for &neighbor in &self.graph.outgoing[node] {
+                if !back_edge_set.contains(&(node, neighbor)) {
+                    // Update layer to be at least one more than current
+                    self.node_layers[neighbor] = self.node_layers[neighbor].max(current_layer + 1);
+                    
+                    in_degree[neighbor] = in_degree[neighbor].saturating_sub(1);
+                    if in_degree[neighbor] == 0 {
+                        queue.push_back(neighbor);
+                    }
+                }
+            }
+        }
+
+        // Handle any remaining nodes (disconnected or in complex cycles)
+        for idx in 0..n {
+            if in_degree[idx] > 0 {
+                // Place in a layer based on any assigned predecessor, or layer 0
+                let max_pred_layer = effective_incoming[idx]
+                    .iter()
+                    .filter(|&&pred| in_degree[pred] == 0 || self.node_layers[pred] > 0)
+                    .map(|&pred| self.node_layers[pred])
+                    .max()
+                    .unwrap_or(0);
+                self.node_layers[idx] = max_pred_layer + 1;
+            }
+        }
+    }
+
+    /// Build the layers structure from node_layers assignments.
+    fn build_layers(&mut self) {
+        let max_layer = self.node_layers.iter().copied().max().unwrap_or(0);
+        self.layers = vec![Vec::new(); max_layer + 1];
+
+        // Initial ordering: by original node order (stable)
+        for (node_idx, &layer) in self.node_layers.iter().enumerate() {
+            self.layers[layer].push(node_idx);
+        }
+
+        // Pre-compute edge positions for ALL nodes to avoid borrow issues
+        let all_edge_positions: HashMap<usize, usize> = (0..self.graph.node_count())
+            .map(|node| (node, self.get_min_incoming_edge_position(node)))
             .collect();
 
-        if layer_nodes.is_empty() {
-            // Cycle detected or remaining nodes, just add them
-            for id in remaining.drain(..) {
-                let layer_idx = layers.len();
-                node_layer.insert(id.clone(), layer_idx);
-                if layers.len() <= layer_idx {
-                    layers.push(Vec::new());
-                }
-                layers[layer_idx].push(id);
-            }
-            break;
-        }
-
-        let layer_idx = layers.len();
-        layers.push(layer_nodes.clone());
-        for id in &layer_nodes {
-            node_layer.insert(id.clone(), layer_idx);
-            remaining.retain(|r| r != id);
+        // For each layer, sort by the order edges were declared from predecessors
+        // Mermaid convention: SECOND-declared edge target goes LEFT
+        for layer in &mut self.layers {
+            // Sort by position in outgoing edge list of predecessor
+            // HIGHER position = later in edge declarations = goes LEFT
+            layer.sort_by(|&a, &b| {
+                let pos_a = all_edge_positions.get(&a).copied().unwrap_or(a);
+                let pos_b = all_edge_positions.get(&b).copied().unwrap_or(b);
+                pos_b.cmp(&pos_a)  // FLIPPED: higher position first
+            });
         }
     }
 
-    // Calculate positions
-    let mut layout = FlowchartLayout::default();
-    let is_horizontal = matches!(flowchart.direction, FlowDirection::LeftRight | FlowDirection::RightLeft);
-    
-    let mut max_x: f32 = 0.0;
-    let mut max_y: f32 = 0.0;
-    let start_margin = 20.0_f32;
-    let mut current_main_pos = start_margin;
-
-    // First pass: calculate total cross-axis size needed
-    let mut max_cross_size: f32 = 0.0;
-    for layer in &layers {
-        let mut layer_cross_size: f32 = 0.0;
-        for id in layer {
-            if let Some(size) = node_sizes.get(id) {
-                layer_cross_size += if is_horizontal { size.y } else { size.x };
+    /// Get the minimum position of a node in any predecessor's outgoing edge list.
+    /// This reflects edge declaration order.
+    fn get_min_incoming_edge_position(&self, node: usize) -> usize {
+        let mut min_pos = usize::MAX;
+        for &pred in &self.graph.incoming[node] {
+            if let Some(pos) = self.graph.outgoing[pred].iter().position(|&n| n == node) {
+                min_pos = min_pos.min(pos);
             }
         }
-        layer_cross_size += (layer.len().saturating_sub(1)) as f32 * 
-            if is_horizontal { node_spacing.y } else { node_spacing.x };
-        max_cross_size = max_cross_size.max(layer_cross_size);
+        if min_pos == usize::MAX { node } else { min_pos }
     }
 
-    for layer in &layers {
-        let mut layer_cross_size: f32 = 0.0;
-        
-        // Calculate total cross-axis size of this layer
-        for id in layer {
-            if let Some(size) = node_sizes.get(id) {
-                layer_cross_size += if is_horizontal { size.y } else { size.x };
+    /// Reduce edge crossings using the barycenter heuristic.
+    /// Iterates top-down and bottom-up to minimize crossings.
+    fn reduce_crossings(&mut self) {
+        let back_edge_set: std::collections::HashSet<(usize, usize)> = 
+            self.graph.back_edges.iter().cloned().collect();
+
+        for _ in 0..self.config.crossing_reduction_iterations {
+            // Top-down pass
+            for layer_idx in 1..self.layers.len() {
+                self.order_layer_by_barycenter(layer_idx, true, &back_edge_set);
+            }
+            // Bottom-up pass
+            for layer_idx in (0..self.layers.len().saturating_sub(1)).rev() {
+                self.order_layer_by_barycenter(layer_idx, false, &back_edge_set);
             }
         }
-        layer_cross_size += (layer.len().saturating_sub(1)) as f32 * 
-            if is_horizontal { node_spacing.y } else { node_spacing.x };
+    }
 
-        // For vertical layouts (TD/BT): center horizontally within available_width
-        // For horizontal layouts (LR/RL): start from top, center within calculated height
-        let start_cross = if is_horizontal {
-            // For LR/RL: center vertically within the max cross size
-            start_margin + (max_cross_size - layer_cross_size) / 2.0
+    /// Order a single layer using barycenter of connected nodes in adjacent layer.
+    fn order_layer_by_barycenter(
+        &mut self,
+        layer_idx: usize,
+        use_predecessors: bool,
+        back_edge_set: &std::collections::HashSet<(usize, usize)>,
+    ) {
+        let adjacent_layer_idx = if use_predecessors {
+            layer_idx.saturating_sub(1)
         } else {
-            // For TD/BT: center horizontally within available width
-            (available_width - layer_cross_size).max(start_margin * 2.0) / 2.0
+            (layer_idx + 1).min(self.layers.len().saturating_sub(1))
         };
 
-        let mut cross_pos = start_cross;
-        
-        for id in layer {
-            if let Some(size) = node_sizes.get(id) {
-                let pos = if is_horizontal {
-                    Pos2::new(current_main_pos, cross_pos)
+        if adjacent_layer_idx == layer_idx {
+            return;
+        }
+
+        // Build position map for adjacent layer
+        let adjacent_positions: HashMap<usize, usize> = self.layers[adjacent_layer_idx]
+            .iter()
+            .enumerate()
+            .map(|(pos, &node)| (node, pos))
+            .collect();
+
+        // Calculate barycenter for each node in current layer
+        // Store: (node_index, barycenter) - we'll use node_index directly as tiebreaker
+        let mut barycenters: Vec<(usize, f32)> = Vec::new();
+
+        for &node in &self.layers[layer_idx] {
+            let neighbors: Vec<usize> = if use_predecessors {
+                self.graph.incoming[node]
+                    .iter()
+                    .filter(|&&pred| !back_edge_set.contains(&(pred, node)))
+                    .copied()
+                    .collect()
+            } else {
+                self.graph.outgoing[node]
+                    .iter()
+                    .filter(|&&succ| !back_edge_set.contains(&(node, succ)))
+                    .copied()
+                    .collect()
+            };
+
+            let barycenter = if neighbors.is_empty() {
+                // Keep relative position if no connections - use node index
+                node as f32
+            } else {
+                let sum: f32 = neighbors
+                    .iter()
+                    .filter_map(|n| adjacent_positions.get(n))
+                    .map(|&pos| pos as f32)
+                    .sum();
+                let count = neighbors
+                    .iter()
+                    .filter(|n| adjacent_positions.contains_key(n))
+                    .count();
+                if count > 0 {
+                    sum / count as f32
                 } else {
-                    Pos2::new(cross_pos, current_main_pos)
+                    node as f32
+                }
+            };
+
+            barycenters.push((node, barycenter));
+        }
+
+        // Sort by barycenter, with edge position as tiebreaker
+        // Mermaid convention: SECOND-declared edge target goes LEFT
+        let edge_positions: HashMap<usize, usize> = barycenters
+            .iter()
+            .map(|&(node, _)| (node, self.get_min_incoming_edge_position(node)))
+            .collect();
+
+        barycenters.sort_by(|a, b| {
+            match a.1.partial_cmp(&b.1) {
+                Some(std::cmp::Ordering::Equal) | None => {
+                    // HIGHER position = later declared = goes left
+                    let pos_a = edge_positions.get(&a.0).copied().unwrap_or(a.0);
+                    let pos_b = edge_positions.get(&b.0).copied().unwrap_or(b.0);
+                    pos_b.cmp(&pos_a)  // FLIPPED
+                }
+                Some(ord) => ord,
+            }
+        });
+
+        // Update layer order
+        self.layers[layer_idx] = barycenters.into_iter().map(|(node, _)| node).collect();
+    }
+
+    /// Assign final coordinates to all nodes.
+    fn assign_coordinates(self) -> FlowchartLayout {
+        let is_horizontal = matches!(self.direction, FlowDirection::LeftRight | FlowDirection::RightLeft);
+        let is_reversed = matches!(self.direction, FlowDirection::BottomUp | FlowDirection::RightLeft);
+
+        let mut layout = FlowchartLayout::default();
+        let margin = self.config.margin;
+
+        // Calculate the maximum cross-axis size for centering
+        let mut layer_cross_sizes: Vec<f32> = Vec::new();
+        for layer in &self.layers {
+            let mut size: f32 = 0.0;
+            for &node_idx in layer {
+                let node_size = self.graph.node_sizes[node_idx];
+                size += if is_horizontal { node_size.y } else { node_size.x };
+            }
+            size += (layer.len().saturating_sub(1)) as f32 
+                * if is_horizontal { self.config.node_spacing.y } else { self.config.node_spacing.x };
+            layer_cross_sizes.push(size);
+        }
+        let max_cross_size = layer_cross_sizes.iter().copied().fold(0.0_f32, f32::max);
+
+        // Calculate layer main-axis sizes (for positioning)
+        let layer_main_sizes: Vec<f32> = self.layers
+            .iter()
+            .map(|layer| {
+                layer
+                    .iter()
+                    .map(|&idx| {
+                        let size = self.graph.node_sizes[idx];
+                        if is_horizontal { size.x } else { size.y }
+                    })
+                    .fold(0.0_f32, f32::max)
+            })
+            .collect();
+
+        // Position nodes layer by layer
+        let mut current_main = margin;
+        let mut max_x: f32 = 0.0;
+        let mut max_y: f32 = 0.0;
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let layer_cross_size = layer_cross_sizes[layer_idx];
+            
+            // Center the layer in cross-axis
+            let start_cross = if is_horizontal {
+                margin + (max_cross_size - layer_cross_size) / 2.0
+            } else {
+                (self.available_width - layer_cross_size).max(margin * 2.0) / 2.0
+            };
+
+            let mut current_cross = start_cross;
+
+            for &node_idx in layer {
+                let node_id = &self.graph.node_ids[node_idx];
+                let size = self.graph.node_sizes[node_idx];
+
+                let pos = if is_horizontal {
+                    Pos2::new(current_main, current_cross)
+                } else {
+                    Pos2::new(current_cross, current_main)
                 };
-                
-                layout.nodes.insert(id.clone(), NodeLayout { pos, size: *size });
-                
+
+                layout.nodes.insert(node_id.clone(), NodeLayout { pos, size });
+
                 max_x = max_x.max(pos.x + size.x);
                 max_y = max_y.max(pos.y + size.y);
-                
-                cross_pos += if is_horizontal { 
-                    size.y + node_spacing.y 
-                } else { 
-                    size.x + node_spacing.x 
+
+                current_cross += if is_horizontal {
+                    size.y + self.config.node_spacing.y
+                } else {
+                    size.x + self.config.node_spacing.x
                 };
             }
+
+            // Advance to next layer
+            current_main += layer_main_sizes[layer_idx] 
+                + if is_horizontal { self.config.node_spacing.x } else { self.config.node_spacing.y };
         }
 
-        // Move to next layer along main axis
-        let max_main_size = layer.iter()
-            .filter_map(|id| node_sizes.get(id))
-            .map(|s| if is_horizontal { s.x } else { s.y })
-            .fold(0.0_f32, |a, b| a.max(b));
-        
-        current_main_pos += max_main_size + if is_horizontal { node_spacing.x } else { node_spacing.y };
-    }
-
-    // Handle reverse directions
-    if matches!(flowchart.direction, FlowDirection::BottomUp | FlowDirection::RightLeft) {
-        let total = if is_horizontal { max_x } else { max_y };
-        for node_layout in layout.nodes.values_mut() {
-            if is_horizontal {
-                node_layout.pos.x = total - node_layout.pos.x - node_layout.size.x + start_margin;
-            } else {
-                node_layout.pos.y = total - node_layout.pos.y - node_layout.size.y + start_margin;
+        // Handle reversed directions (BT, RL)
+        if is_reversed {
+            let total = if is_horizontal { max_x } else { max_y };
+            for node_layout in layout.nodes.values_mut() {
+                if is_horizontal {
+                    node_layout.pos.x = total - node_layout.pos.x - node_layout.size.x + margin;
+                } else {
+                    node_layout.pos.y = total - node_layout.pos.y - node_layout.size.y + margin;
+                }
             }
         }
-    }
 
-    layout.total_size = Vec2::new(max_x + start_margin, max_y + start_margin);
-    layout
+        // Convert back-edge indices to node IDs
+        for &(from_idx, to_idx) in &self.graph.back_edges {
+            let from_id = self.graph.node_ids[from_idx].clone();
+            let to_id = self.graph.node_ids[to_idx].clone();
+            layout.back_edges.insert((from_id, to_id));
+        }
+
+        layout.total_size = Vec2::new(max_x + margin, max_y + margin);
+        layout
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -575,6 +1360,9 @@ pub struct FlowchartColors {
     pub edge_label_text: Color32,
     pub diamond_fill: Color32,
     pub circle_fill: Color32,
+    pub subgraph_fill: Color32,
+    pub subgraph_stroke: Color32,
+    pub subgraph_title: Color32,
 }
 
 impl FlowchartColors {
@@ -588,6 +1376,9 @@ impl FlowchartColors {
             edge_label_text: Color32::from_rgb(180, 190, 200),
             diamond_fill: Color32::from_rgb(60, 50, 70),
             circle_fill: Color32::from_rgb(50, 65, 75),
+            subgraph_fill: Color32::from_rgba_unmultiplied(60, 70, 90, 40),
+            subgraph_stroke: Color32::from_rgb(80, 100, 130),
+            subgraph_title: Color32::from_rgb(160, 175, 195),
         }
     }
 
@@ -601,8 +1392,17 @@ impl FlowchartColors {
             edge_label_text: Color32::from_rgb(60, 70, 80),
             diamond_fill: Color32::from_rgb(255, 250, 240),
             circle_fill: Color32::from_rgb(240, 250, 255),
+            subgraph_fill: Color32::from_rgba_unmultiplied(200, 210, 230, 60),
+            subgraph_stroke: Color32::from_rgb(150, 170, 200),
+            subgraph_title: Color32::from_rgb(80, 95, 120),
         }
     }
+}
+
+/// Pre-computed edge label information for rendering.
+struct EdgeLabelInfo {
+    display_text: String,
+    size: Vec2,
 }
 
 /// Render a flowchart to the UI.
@@ -617,6 +1417,46 @@ pub fn render_flowchart(
         return;
     }
 
+    // Pre-compute edge label sizes before allocating painter
+    // This avoids borrow checker issues with text measurement during drawing
+    let label_font_size = font_size - 2.0;
+    let edge_labels: HashMap<usize, EdgeLabelInfo> = {
+        let text_measurer = EguiTextMeasurer::new(ui);
+        flowchart.edges.iter().enumerate()
+            .filter_map(|(idx, edge)| {
+                edge.label.as_ref().map(|label| {
+                    // Calculate max label width based on edge geometry
+                    let (from_layout, to_layout) = match (layout.nodes.get(&edge.from), layout.nodes.get(&edge.to)) {
+                        (Some(f), Some(t)) => (f, t),
+                        _ => return None,
+                    };
+                    let from_center = from_layout.pos + from_layout.size / 2.0;
+                    let to_center = to_layout.pos + to_layout.size / 2.0;
+                    let edge_length = ((to_center.x - from_center.x).powi(2) +
+                                       (to_center.y - from_center.y).powi(2)).sqrt();
+                    let max_label_width = edge_length.max(60.0).min(200.0) * 0.8;
+
+                    // Measure and potentially truncate
+                    let text_size = text_measurer.measure(label, label_font_size);
+                    let display_text = if text_size.width > max_label_width {
+                        text_measurer.truncate_with_ellipsis(label, label_font_size, max_label_width)
+                    } else {
+                        label.clone()
+                    };
+
+                    let display_size = text_measurer.measure(&display_text, label_font_size);
+                    let label_padding = Vec2::new(8.0, 4.0);
+                    let size = Vec2::new(
+                        display_size.width + label_padding.x,
+                        display_size.height + label_padding.y,
+                    );
+
+                    Some((idx, EdgeLabelInfo { display_text, size }))
+                })?
+            })
+            .collect()
+    };
+
     // Allocate space for the diagram
     let (response, painter) = ui.allocate_painter(
         layout.total_size,
@@ -624,18 +1464,61 @@ pub fn render_flowchart(
     );
     let offset = response.rect.min.to_vec2();
 
-    // Draw edges first (behind nodes)
-    for edge in &flowchart.edges {
-        if let (Some(from_layout), Some(to_layout)) = (layout.nodes.get(&edge.from), layout.nodes.get(&edge.to)) {
-            draw_edge(&painter, edge, from_layout, to_layout, offset, colors, font_size, flowchart.direction);
+    // Draw subgraphs first (behind everything else)
+    // Draw in reverse order so parent subgraphs are behind children
+    for subgraph in flowchart.subgraphs.iter().rev() {
+        if let Some(sg_layout) = layout.subgraphs.get(&subgraph.id) {
+            draw_subgraph(&painter, sg_layout, offset, colors, font_size);
         }
     }
 
-    // Draw nodes
+    // Draw edges (behind nodes but above subgraphs)
+    for (idx, edge) in flowchart.edges.iter().enumerate() {
+        if let (Some(from_layout), Some(to_layout)) = (layout.nodes.get(&edge.from), layout.nodes.get(&edge.to)) {
+            let label_info = edge_labels.get(&idx);
+            let is_back_edge = layout.back_edges.contains(&(edge.from.clone(), edge.to.clone()));
+            draw_edge(&painter, edge, from_layout, to_layout, offset, colors, label_font_size, flowchart.direction, label_info, is_back_edge, &layout.total_size);
+        }
+    }
+
+    // Draw nodes (on top)
     for node in &flowchart.nodes {
         if let Some(node_layout) = layout.nodes.get(&node.id) {
             draw_node(&painter, node, node_layout, offset, colors, font_size);
         }
+    }
+}
+
+fn draw_subgraph(
+    painter: &egui::Painter,
+    layout: &SubgraphLayout,
+    offset: Vec2,
+    colors: &FlowchartColors,
+    font_size: f32,
+) {
+    let rect = Rect::from_min_size(layout.pos + offset, layout.size);
+    
+    // Draw semi-transparent background with rounded corners
+    painter.rect(
+        rect,
+        Rounding::same(8.0),
+        colors.subgraph_fill,
+        Stroke::new(1.5, colors.subgraph_stroke),
+    );
+
+    // Draw title if present
+    if let Some(title) = &layout.title {
+        let title_pos = Pos2::new(
+            rect.left() + 12.0,
+            rect.top() + 6.0,
+        );
+        painter.text(
+            title_pos,
+            egui::Align2::LEFT_TOP,
+            title,
+            FontId::proportional(font_size - 2.0),
+            colors.subgraph_title,
+        );
     }
 }
 
@@ -768,39 +1651,14 @@ fn draw_edge(
     to_layout: &NodeLayout,
     offset: Vec2,
     colors: &FlowchartColors,
-    font_size: f32,
+    label_font_size: f32,
     direction: FlowDirection,
+    label_info: Option<&EdgeLabelInfo>,
+    is_back_edge: bool,
+    total_size: &Vec2,
 ) {
     let from_rect = Rect::from_min_size(from_layout.pos + offset, from_layout.size);
     let to_rect = Rect::from_min_size(to_layout.pos + offset, to_layout.size);
-
-    // Calculate connection points based on direction
-    let (start, end) = match direction {
-        FlowDirection::TopDown => {
-            (
-                Pos2::new(from_rect.center().x, from_rect.bottom()),
-                Pos2::new(to_rect.center().x, to_rect.top()),
-            )
-        }
-        FlowDirection::BottomUp => {
-            (
-                Pos2::new(from_rect.center().x, from_rect.top()),
-                Pos2::new(to_rect.center().x, to_rect.bottom()),
-            )
-        }
-        FlowDirection::LeftRight => {
-            (
-                Pos2::new(from_rect.right(), from_rect.center().y),
-                Pos2::new(to_rect.left(), to_rect.center().y),
-            )
-        }
-        FlowDirection::RightLeft => {
-            (
-                Pos2::new(from_rect.left(), from_rect.center().y),
-                Pos2::new(to_rect.right(), to_rect.center().y),
-            )
-        }
-    };
 
     // Edge style
     let stroke_width = match edge.style {
@@ -811,38 +1669,180 @@ fn draw_edge(
 
     let stroke = Stroke::new(stroke_width, colors.edge_stroke);
 
-    // Draw the line
-    if matches!(edge.style, EdgeStyle::Dotted) {
-        // Draw dashed line
-        draw_dashed_line(painter, start, end, stroke, 5.0, 3.0);
+    // Handle back-edges with curved routing (like Mermaid)
+    if is_back_edge {
+        let (start, end, ctrl1, ctrl2) = match direction {
+            FlowDirection::TopDown => {
+                // Back-edge goes up: start from top of source, end at BOTTOM-CENTER of target
+                let start = Pos2::new(from_rect.left(), from_rect.center().y);
+                let end = Pos2::new(to_rect.center().x, to_rect.bottom());
+                // Curve: go left from start, then curve up and right to bottom of target
+                let curve_x = start.x - 40.0;
+                let ctrl1 = Pos2::new(curve_x, start.y);
+                let ctrl2 = Pos2::new(curve_x, end.y + 30.0);
+                (start, end, ctrl1, ctrl2)
+            }
+            FlowDirection::BottomUp => {
+                let start = Pos2::new(from_rect.right(), from_rect.center().y);
+                let end = Pos2::new(to_rect.right(), to_rect.center().y);
+                let curve_x = start.x.max(end.x) + 30.0;
+                let ctrl1 = Pos2::new(curve_x, start.y);
+                let ctrl2 = Pos2::new(curve_x, end.y);
+                (start, end, ctrl1, ctrl2)
+            }
+            FlowDirection::LeftRight => {
+                let start = Pos2::new(from_rect.center().x, from_rect.top());
+                let end = Pos2::new(to_rect.center().x, to_rect.top());
+                let curve_y = start.y.min(end.y) - 30.0;
+                let ctrl1 = Pos2::new(start.x, curve_y);
+                let ctrl2 = Pos2::new(end.x, curve_y);
+                (start, end, ctrl1, ctrl2)
+            }
+            FlowDirection::RightLeft => {
+                let start = Pos2::new(from_rect.center().x, from_rect.bottom());
+                let end = Pos2::new(to_rect.center().x, to_rect.bottom());
+                let curve_y = start.y.max(end.y) + 30.0;
+                let ctrl1 = Pos2::new(start.x, curve_y);
+                let ctrl2 = Pos2::new(end.x, curve_y);
+                (start, end, ctrl1, ctrl2)
+            }
+        };
+
+        // Draw cubic bezier curve
+        draw_bezier_curve(painter, start, ctrl1, ctrl2, end, stroke);
+
+        // Arrow at end - calculate direction from last curve segment
+        if !matches!(edge.arrow_end, ArrowHead::None) {
+            // Approximate arrow direction from control point to end
+            draw_arrow_head(painter, ctrl2, end, &edge.arrow_end, colors.edge_stroke, stroke_width);
+        }
+
+        // Label at midpoint of the curve
+        if let Some(info) = label_info {
+            // Approximate midpoint of bezier
+            let t = 0.5;
+            let mid = bezier_point(start, ctrl1, ctrl2, end, t);
+            let label_pos = Pos2::new(mid.x - info.size.x / 2.0 - 8.0, mid.y);
+            let label_rect = Rect::from_center_size(label_pos, info.size);
+            painter.rect_filled(label_rect, Rounding::same(3.0), colors.edge_label_bg);
+            painter.text(
+                label_pos,
+                egui::Align2::CENTER_CENTER,
+                &info.display_text,
+                FontId::proportional(label_font_size),
+                colors.edge_label_text,
+            );
+        }
     } else {
-        painter.line_segment([start, end], stroke);
-    }
+        // Normal edge - use smart routing based on relative positions
+        // For diamond/decision nodes, exit from corner closest to target
+        let (start, end) = match direction {
+            FlowDirection::TopDown => {
+                let from_center_x = from_rect.center().x;
+                let to_center_x = to_rect.center().x;
+                
+                // Determine exit point based on target position relative to source
+                // This prevents crossing edges from decision nodes
+                let start_x = if (to_center_x - from_center_x).abs() < 10.0 {
+                    // Target is roughly centered - exit from center
+                    from_center_x
+                } else if to_center_x < from_center_x {
+                    // Target is to the left - exit from left side of bottom
+                    from_rect.center().x - from_rect.width() * 0.25
+                } else {
+                    // Target is to the right - exit from right side of bottom  
+                    from_rect.center().x + from_rect.width() * 0.25
+                };
+                
+                (
+                    Pos2::new(start_x, from_rect.bottom()),
+                    Pos2::new(to_rect.center().x, to_rect.top()),
+                )
+            }
+            FlowDirection::BottomUp => {
+                let from_center_x = from_rect.center().x;
+                let to_center_x = to_rect.center().x;
+                
+                let start_x = if (to_center_x - from_center_x).abs() < 10.0 {
+                    from_center_x
+                } else if to_center_x < from_center_x {
+                    from_rect.center().x - from_rect.width() * 0.25
+                } else {
+                    from_rect.center().x + from_rect.width() * 0.25
+                };
+                
+                (
+                    Pos2::new(start_x, from_rect.top()),
+                    Pos2::new(to_rect.center().x, to_rect.bottom()),
+                )
+            }
+            FlowDirection::LeftRight => {
+                let from_center_y = from_rect.center().y;
+                let to_center_y = to_rect.center().y;
+                
+                let start_y = if (to_center_y - from_center_y).abs() < 10.0 {
+                    from_center_y
+                } else if to_center_y < from_center_y {
+                    from_rect.center().y - from_rect.height() * 0.25
+                } else {
+                    from_rect.center().y + from_rect.height() * 0.25
+                };
+                
+                (
+                    Pos2::new(from_rect.right(), start_y),
+                    Pos2::new(to_rect.left(), to_rect.center().y),
+                )
+            }
+            FlowDirection::RightLeft => {
+                let from_center_y = from_rect.center().y;
+                let to_center_y = to_rect.center().y;
+                
+                let start_y = if (to_center_y - from_center_y).abs() < 10.0 {
+                    from_center_y
+                } else if to_center_y < from_center_y {
+                    from_rect.center().y - from_rect.height() * 0.25
+                } else {
+                    from_rect.center().y + from_rect.height() * 0.25
+                };
+                
+                (
+                    Pos2::new(from_rect.left(), start_y),
+                    Pos2::new(to_rect.right(), to_rect.center().y),
+                )
+            }
+        };
 
-    // Draw arrow head at end
-    if !matches!(edge.arrow_end, ArrowHead::None) {
-        draw_arrow_head(painter, start, end, &edge.arrow_end, colors.edge_stroke, stroke_width);
-    }
+        // Draw the line
+        if matches!(edge.style, EdgeStyle::Dotted) {
+            draw_dashed_line(painter, start, end, stroke, 5.0, 3.0);
+        } else {
+            painter.line_segment([start, end], stroke);
+        }
 
-    // Draw arrow head at start (for bidirectional)
-    if !matches!(edge.arrow_start, ArrowHead::None) {
-        draw_arrow_head(painter, end, start, &edge.arrow_start, colors.edge_stroke, stroke_width);
-    }
+        // Draw arrow head at end
+        if !matches!(edge.arrow_end, ArrowHead::None) {
+            draw_arrow_head(painter, start, end, &edge.arrow_end, colors.edge_stroke, stroke_width);
+        }
 
-    // Draw edge label
-    if let Some(label) = &edge.label {
-        let mid = Pos2::new((start.x + end.x) / 2.0, (start.y + end.y) / 2.0);
-        let label_size = Vec2::new(label.len() as f32 * font_size * 0.5 + 8.0, font_size + 4.0);
-        let label_rect = Rect::from_center_size(mid, label_size);
-        
-        painter.rect_filled(label_rect, Rounding::same(3.0), colors.edge_label_bg);
-        painter.text(
-            mid,
-            egui::Align2::CENTER_CENTER,
-            label,
-            FontId::proportional(font_size - 2.0),
-            colors.edge_label_text,
-        );
+        // Draw arrow head at start (for bidirectional)
+        if !matches!(edge.arrow_start, ArrowHead::None) {
+            draw_arrow_head(painter, end, start, &edge.arrow_start, colors.edge_stroke, stroke_width);
+        }
+
+        // Draw edge label using pre-computed sizes
+        if let Some(info) = label_info {
+            let mid = Pos2::new((start.x + end.x) / 2.0, (start.y + end.y) / 2.0);
+            let label_rect = Rect::from_center_size(mid, info.size);
+
+            painter.rect_filled(label_rect, Rounding::same(3.0), colors.edge_label_bg);
+            painter.text(
+                mid,
+                egui::Align2::CENTER_CENTER,
+                &info.display_text,
+                FontId::proportional(label_font_size),
+                colors.edge_label_text,
+            );
+        }
     }
 }
 
@@ -857,6 +1857,33 @@ fn draw_dashed_line(painter: &egui::Painter, start: Pos2, end: Pos2, stroke: Str
         let seg_end = start + dir * seg_end_pos;
         painter.line_segment([seg_start, seg_end], stroke);
         pos = seg_end_pos + gap_len;
+    }
+}
+
+/// Calculate a point on a cubic bezier curve at parameter t (0..1)
+fn bezier_point(p0: Pos2, p1: Pos2, p2: Pos2, p3: Pos2, t: f32) -> Pos2 {
+    let t2 = t * t;
+    let t3 = t2 * t;
+    let mt = 1.0 - t;
+    let mt2 = mt * mt;
+    let mt3 = mt2 * mt;
+    
+    Pos2::new(
+        mt3 * p0.x + 3.0 * mt2 * t * p1.x + 3.0 * mt * t2 * p2.x + t3 * p3.x,
+        mt3 * p0.y + 3.0 * mt2 * t * p1.y + 3.0 * mt * t2 * p2.y + t3 * p3.y,
+    )
+}
+
+/// Draw a cubic bezier curve by sampling points
+fn draw_bezier_curve(painter: &egui::Painter, p0: Pos2, p1: Pos2, p2: Pos2, p3: Pos2, stroke: Stroke) {
+    let segments = 20; // Number of line segments to approximate the curve
+    let mut prev = p0;
+    
+    for i in 1..=segments {
+        let t = i as f32 / segments as f32;
+        let curr = bezier_point(p0, p1, p2, p3, t);
+        painter.line_segment([prev, curr], stroke);
+        prev = curr;
     }
 }
 
@@ -924,26 +1951,152 @@ pub struct Message {
     pub to: String,
     pub label: String,
     pub message_type: MessageType,
+    /// Activate the target participant when this message is sent
+    pub activate_target: bool,
+    /// Deactivate the target participant when this message is sent
+    pub deactivate_target: bool,
+}
+
+/// Position for a note in a sequence diagram.
+#[derive(Debug, Clone)]
+pub enum NotePosition {
+    LeftOf(String),
+    RightOf(String),
+    Over(Vec<String>),
+}
+
+/// A note in a sequence diagram.
+#[derive(Debug, Clone)]
+pub struct SeqNote {
+    pub position: NotePosition,
+    pub text: String,
+}
+
+/// Type of control-flow block in sequence diagram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeqBlockKind {
+    Loop,
+    Alt,
+    Opt,
+    Par,
+}
+
+impl SeqBlockKind {
+    fn from_keyword(kw: &str) -> Option<Self> {
+        match kw {
+            "loop" => Some(Self::Loop),
+            "alt" => Some(Self::Alt),
+            "opt" => Some(Self::Opt),
+            "par" => Some(Self::Par),
+            _ => None,
+        }
+    }
+    
+    fn display_name(&self) -> &'static str {
+        match self {
+            Self::Loop => "loop",
+            Self::Alt => "alt",
+            Self::Opt => "opt",
+            Self::Par => "par",
+        }
+    }
+}
+
+/// A segment within a control-flow block (e.g., alt branches, par branches).
+#[derive(Debug, Clone)]
+pub struct SeqBlockSegment {
+    pub segment_label: Option<String>,
+    pub statements: Vec<SeqStatement>,
+}
+
+/// A control-flow block in a sequence diagram (loop, alt, opt, par).
+#[derive(Debug, Clone)]
+pub struct SeqBlock {
+    pub kind: SeqBlockKind,
+    pub label: String,
+    pub segments: Vec<SeqBlockSegment>,
+}
+
+/// A statement in a sequence diagram - message, block, note, or activation directive.
+#[derive(Debug, Clone)]
+pub enum SeqStatement {
+    Message(Message),
+    Block(SeqBlock),
+    Note(SeqNote),
+    Activate(String),
+    Deactivate(String),
 }
 
 /// A parsed sequence diagram.
 #[derive(Debug, Clone, Default)]
 pub struct SequenceDiagram {
     pub participants: Vec<Participant>,
-    pub messages: Vec<Message>,
+    pub statements: Vec<SeqStatement>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Sequence Diagram Parser
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Helper struct for building control-flow blocks during parsing.
+struct SeqBlockBuilder {
+    kind: SeqBlockKind,
+    label: String,
+    segments: Vec<SeqBlockSegment>,
+    current_segment_label: Option<String>,
+    current_segment_statements: Vec<SeqStatement>,
+}
+
+impl SeqBlockBuilder {
+    fn new(kind: SeqBlockKind, label: String) -> Self {
+        Self {
+            kind,
+            label,
+            segments: Vec::new(),
+            // First segment label is shown in the block header, not as a segment label
+            current_segment_label: None,
+            current_segment_statements: Vec::new(),
+        }
+    }
+    
+    fn start_new_segment(&mut self, label: Option<String>) {
+        // Finalize current segment
+        if !self.current_segment_statements.is_empty() || self.current_segment_label.is_some() {
+            self.segments.push(SeqBlockSegment {
+                segment_label: self.current_segment_label.take(),
+                statements: std::mem::take(&mut self.current_segment_statements),
+            });
+        }
+        self.current_segment_label = label;
+    }
+    
+    fn add_statement(&mut self, stmt: SeqStatement) {
+        self.current_segment_statements.push(stmt);
+    }
+    
+    fn finalize(mut self) -> SeqBlock {
+        // Finalize the last segment
+        self.segments.push(SeqBlockSegment {
+            segment_label: self.current_segment_label,
+            statements: self.current_segment_statements,
+        });
+        
+        SeqBlock {
+            kind: self.kind,
+            label: self.label,
+            segments: self.segments,
+        }
+    }
+}
+
 /// Parse mermaid sequence diagram source.
 pub fn parse_sequence_diagram(source: &str) -> Result<SequenceDiagram, String> {
     let mut diagram = SequenceDiagram::default();
     let mut participant_map: HashMap<String, usize> = HashMap::new();
-    let lines = source.lines().skip(1); // Skip "sequenceDiagram" header
+    let mut block_stack: Vec<SeqBlockBuilder> = Vec::new();
+    let lines: Vec<&str> = source.lines().skip(1).collect(); // Skip "sequenceDiagram" header
 
-    for line in lines {
+    for (line_num, line) in lines.iter().enumerate() {
         let line = line.trim();
         
         // Skip empty lines and comments
@@ -973,7 +2126,147 @@ pub fn parse_sequence_diagram(source: &str) -> Result<SequenceDiagram, String> {
             continue;
         }
 
-        // Parse message: A->>B: Message or A-->>B: Message
+        // Parse control-flow block keywords
+        let first_word = line.split_whitespace().next().unwrap_or("");
+        
+        // Handle block start: loop, alt, opt, par
+        if let Some(kind) = SeqBlockKind::from_keyword(first_word) {
+            let label = line[first_word.len()..].trim().to_string();
+            block_stack.push(SeqBlockBuilder::new(kind, label));
+            continue;
+        }
+        
+        // Handle else (for alt blocks)
+        if first_word == "else" {
+            if let Some(builder) = block_stack.last_mut() {
+                if builder.kind == SeqBlockKind::Alt {
+                    let label = line[4..].trim();
+                    let label = if label.is_empty() { None } else { Some(label.to_string()) };
+                    builder.start_new_segment(label);
+                } else {
+                    return Err(format!(
+                        "Line {}: 'else' can only be used inside 'alt' blocks, found inside '{}'",
+                        line_num + 2, builder.kind.display_name()
+                    ));
+                }
+            } else {
+                return Err(format!("Line {}: 'else' without matching 'alt' block", line_num + 2));
+            }
+            continue;
+        }
+        
+        // Handle and (for par blocks)
+        if first_word == "and" {
+            if let Some(builder) = block_stack.last_mut() {
+                if builder.kind == SeqBlockKind::Par {
+                    let label = line[3..].trim();
+                    let label = if label.is_empty() { None } else { Some(label.to_string()) };
+                    builder.start_new_segment(label);
+                } else {
+                    return Err(format!(
+                        "Line {}: 'and' can only be used inside 'par' blocks, found inside '{}'",
+                        line_num + 2, builder.kind.display_name()
+                    ));
+                }
+            } else {
+                return Err(format!("Line {}: 'and' without matching 'par' block", line_num + 2));
+            }
+            continue;
+        }
+        
+        // Handle end (close current block)
+        if first_word == "end" {
+            if let Some(builder) = block_stack.pop() {
+                let block = builder.finalize();
+                let stmt = SeqStatement::Block(block);
+                
+                // Add to parent block or top-level
+                if let Some(parent) = block_stack.last_mut() {
+                    parent.add_statement(stmt);
+                } else {
+                    diagram.statements.push(stmt);
+                }
+            } else {
+                return Err(format!("Line {}: 'end' without matching block opener", line_num + 2));
+            }
+            continue;
+        }
+
+        // Parse activate/deactivate commands
+        if first_word == "activate" {
+            let participant_id = line[8..].trim().to_string();
+            if !participant_id.is_empty() {
+                // Auto-add participant if not declared
+                if !participant_map.contains_key(&participant_id) {
+                    participant_map.insert(participant_id.clone(), diagram.participants.len());
+                    diagram.participants.push(Participant {
+                        id: participant_id.clone(),
+                        label: participant_id.clone(),
+                        is_actor: false,
+                    });
+                }
+                
+                let stmt = SeqStatement::Activate(participant_id);
+                if let Some(builder) = block_stack.last_mut() {
+                    builder.add_statement(stmt);
+                } else {
+                    diagram.statements.push(stmt);
+                }
+            }
+            continue;
+        }
+        
+        if first_word == "deactivate" {
+            let participant_id = line[10..].trim().to_string();
+            if !participant_id.is_empty() {
+                let stmt = SeqStatement::Deactivate(participant_id);
+                if let Some(builder) = block_stack.last_mut() {
+                    builder.add_statement(stmt);
+                } else {
+                    diagram.statements.push(stmt);
+                }
+            }
+            continue;
+        }
+
+        // Parse Note syntax
+        if let Some(note) = parse_sequence_note(line) {
+            // Auto-add participants referenced in note
+            match &note.position {
+                NotePosition::LeftOf(id) | NotePosition::RightOf(id) => {
+                    if !participant_map.contains_key(id) {
+                        participant_map.insert(id.clone(), diagram.participants.len());
+                        diagram.participants.push(Participant {
+                            id: id.clone(),
+                            label: id.clone(),
+                            is_actor: false,
+                        });
+                    }
+                }
+                NotePosition::Over(ids) => {
+                    for id in ids {
+                        if !participant_map.contains_key(id) {
+                            participant_map.insert(id.clone(), diagram.participants.len());
+                            diagram.participants.push(Participant {
+                                id: id.clone(),
+                                label: id.clone(),
+                                is_actor: false,
+                            });
+                        }
+                    }
+                }
+            }
+            
+            let stmt = SeqStatement::Note(note);
+            if let Some(builder) = block_stack.last_mut() {
+                builder.add_statement(stmt);
+            } else {
+                diagram.statements.push(stmt);
+            }
+            continue;
+        }
+
+        // Parse message: A->>B: Message or A-->>B: Message (including +/- shorthand)
         if let Some(msg) = parse_sequence_message(line) {
             // Auto-add participants if not declared
             for id in [&msg.from, &msg.to] {
@@ -986,8 +2279,24 @@ pub fn parse_sequence_diagram(source: &str) -> Result<SequenceDiagram, String> {
                     });
                 }
             }
-            diagram.messages.push(msg);
+            
+            let stmt = SeqStatement::Message(msg);
+            
+            // Add to current block or top-level
+            if let Some(builder) = block_stack.last_mut() {
+                builder.add_statement(stmt);
+            } else {
+                diagram.statements.push(stmt);
+            }
         }
+    }
+    
+    // Check for unclosed blocks
+    if let Some(builder) = block_stack.last() {
+        return Err(format!(
+            "Unclosed '{}' block at end of diagram",
+            builder.kind.display_name()
+        ));
     }
 
     if diagram.participants.is_empty() {
@@ -999,17 +2308,31 @@ pub fn parse_sequence_diagram(source: &str) -> Result<SequenceDiagram, String> {
 
 fn parse_sequence_message(line: &str) -> Option<Message> {
     // Arrow patterns to check (order matters - check longer patterns first)
+    // Include patterns with +/- for activation shorthand
     let arrow_patterns = [
-        ("-->>", MessageType::Dotted),
-        ("->>", MessageType::Solid),
-        ("-->", MessageType::DottedOpen),
-        ("->", MessageType::SolidOpen),
+        ("-->>+", MessageType::Dotted, false, true),
+        ("-->>-", MessageType::Dotted, false, false), // deactivate handled separately
+        ("->>+", MessageType::Solid, false, true),
+        ("->>-", MessageType::Solid, false, false),
+        ("-->+", MessageType::DottedOpen, false, true),
+        ("-->-", MessageType::DottedOpen, false, false),
+        ("->+", MessageType::SolidOpen, false, true),
+        ("->-", MessageType::SolidOpen, false, false),
+        ("-->>", MessageType::Dotted, false, false),
+        ("->>", MessageType::Solid, false, false),
+        ("-->", MessageType::DottedOpen, false, false),
+        ("->", MessageType::SolidOpen, false, false),
     ];
 
-    for (pattern, msg_type) in arrow_patterns {
+    for (pattern, msg_type, _, is_activate) in arrow_patterns {
         if let Some(arrow_pos) = line.find(pattern) {
             let from = line[..arrow_pos].trim();
             let rest = &line[arrow_pos + pattern.len()..];
+            
+            // Check for deactivate (pattern ends with -)
+            let is_deactivate = pattern.ends_with('-') && !pattern.ends_with("->") && !pattern.ends_with(">>");
+            let activate_target = is_activate || pattern.ends_with('+');
+            let deactivate_target = is_deactivate;
             
             // Find the colon for the message label
             let (to, label) = if let Some(colon_pos) = rest.find(':') {
@@ -1026,6 +2349,8 @@ fn parse_sequence_message(line: &str) -> Option<Message> {
                     to: to.to_string(),
                     label: label.to_string(),
                     message_type: msg_type,
+                    activate_target,
+                    deactivate_target,
                 });
             }
         }
@@ -1034,9 +2359,188 @@ fn parse_sequence_message(line: &str) -> Option<Message> {
     None
 }
 
+/// Parse a Note statement in a sequence diagram.
+/// Supports: Note left of X:, Note right of X:, Note over X:, Note over X,Y:
+fn parse_sequence_note(line: &str) -> Option<SeqNote> {
+    let line_lower = line.to_lowercase();
+    
+    if !line_lower.starts_with("note ") {
+        return None;
+    }
+    
+    let rest = &line[5..]; // Skip "Note "
+    
+    // Find the colon separator
+    let colon_pos = rest.find(':')?;
+    let position_part = rest[..colon_pos].trim();
+    let text = rest[colon_pos + 1..].trim().to_string();
+    
+    let position_lower = position_part.to_lowercase();
+    
+    let position = if position_lower.starts_with("left of ") {
+        let participant = position_part[8..].trim().to_string();
+        NotePosition::LeftOf(participant)
+    } else if position_lower.starts_with("right of ") {
+        let participant = position_part[9..].trim().to_string();
+        NotePosition::RightOf(participant)
+    } else if position_lower.starts_with("over ") {
+        let participants_str = position_part[5..].trim();
+        let participants: Vec<String> = participants_str
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if participants.is_empty() {
+            return None;
+        }
+        NotePosition::Over(participants)
+    } else {
+        return None;
+    };
+    
+    Some(SeqNote { position, text })
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Sequence Diagram Renderer
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Colors for sequence diagram rendering.
+struct SeqColors {
+    bg: Color32,
+    stroke: Color32,
+    text: Color32,
+    lifeline: Color32,
+    actor: Color32,
+    block_loop: Color32,
+    block_alt: Color32,
+    block_opt: Color32,
+    block_par: Color32,
+    block_stroke: Color32,
+    block_text: Color32,
+    activation_fill: Color32,
+    activation_stroke: Color32,
+    note_fill: Color32,
+    note_stroke: Color32,
+    note_text: Color32,
+}
+
+impl SeqColors {
+    fn new(dark_mode: bool) -> Self {
+        if dark_mode {
+            Self {
+                bg: Color32::from_rgb(45, 55, 72),
+                stroke: Color32::from_rgb(100, 140, 180),
+                text: Color32::from_rgb(220, 230, 240),
+                lifeline: Color32::from_rgb(80, 100, 120),
+                actor: Color32::from_rgb(100, 160, 220),
+                block_loop: Color32::from_rgba_unmultiplied(100, 180, 100, 30),
+                block_alt: Color32::from_rgba_unmultiplied(180, 140, 100, 30),
+                block_opt: Color32::from_rgba_unmultiplied(100, 140, 180, 30),
+                block_par: Color32::from_rgba_unmultiplied(180, 100, 180, 30),
+                block_stroke: Color32::from_rgb(120, 140, 160),
+                block_text: Color32::from_rgb(200, 210, 220),
+                activation_fill: Color32::from_rgb(70, 90, 110),
+                activation_stroke: Color32::from_rgb(100, 140, 180),
+                note_fill: Color32::from_rgb(80, 80, 60),
+                note_stroke: Color32::from_rgb(140, 140, 100),
+                note_text: Color32::from_rgb(220, 220, 200),
+            }
+        } else {
+            Self {
+                bg: Color32::from_rgb(240, 245, 250),
+                stroke: Color32::from_rgb(100, 140, 180),
+                text: Color32::from_rgb(30, 40, 50),
+                lifeline: Color32::from_rgb(180, 190, 200),
+                actor: Color32::from_rgb(50, 120, 180),
+                block_loop: Color32::from_rgba_unmultiplied(100, 180, 100, 40),
+                block_alt: Color32::from_rgba_unmultiplied(220, 180, 100, 40),
+                block_opt: Color32::from_rgba_unmultiplied(100, 140, 220, 40),
+                block_par: Color32::from_rgba_unmultiplied(200, 100, 200, 40),
+                block_stroke: Color32::from_rgb(100, 120, 140),
+                block_text: Color32::from_rgb(40, 50, 60),
+                activation_fill: Color32::from_rgb(200, 220, 240),
+                activation_stroke: Color32::from_rgb(100, 140, 180),
+                note_fill: Color32::from_rgb(255, 255, 220),
+                note_stroke: Color32::from_rgb(180, 180, 140),
+                note_text: Color32::from_rgb(60, 60, 40),
+            }
+        }
+    }
+    
+    fn block_fill(&self, kind: &SeqBlockKind) -> Color32 {
+        match kind {
+            SeqBlockKind::Loop => self.block_loop,
+            SeqBlockKind::Alt => self.block_alt,
+            SeqBlockKind::Opt => self.block_opt,
+            SeqBlockKind::Par => self.block_par,
+        }
+    }
+}
+
+/// Count total message slots needed for a list of statements (recursive for blocks).
+fn count_statement_slots(statements: &[SeqStatement]) -> usize {
+    let mut count = 0;
+    for stmt in statements {
+        match stmt {
+            SeqStatement::Message(_) => count += 1,
+            SeqStatement::Note(_) => count += 1,
+            SeqStatement::Activate(_) | SeqStatement::Deactivate(_) => {
+                // Activation directives don't take visual slots
+            }
+            SeqStatement::Block(block) => {
+                // Add header slot for the block label
+                count += 1;
+                for segment in &block.segments {
+                    count += count_statement_slots(&segment.statements);
+                    // Add separator slot between segments (except for last)
+                }
+                // Add footer slot for the block
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+/// Layout constants for sequence diagram.
+struct SeqLayout {
+    min_participant_width: f32,
+    participant_height: f32,
+    participant_spacing: f32,
+    message_height: f32,
+    margin: f32,
+    lifeline_extend: f32,
+    participant_padding: f32,
+    block_padding: f32,
+    block_label_height: f32,
+    activation_width: f32,
+    activation_offset: f32,
+    note_width: f32,
+    note_padding: f32,
+    note_corner_size: f32,
+}
+
+impl Default for SeqLayout {
+    fn default() -> Self {
+        Self {
+            min_participant_width: 80.0,
+            participant_height: 40.0,
+            participant_spacing: 50.0,
+            message_height: 40.0,
+            margin: 20.0,
+            lifeline_extend: 30.0,
+            participant_padding: 24.0,
+            block_padding: 8.0,
+            block_label_height: 20.0,
+            activation_width: 10.0,
+            activation_offset: 4.0,
+            note_width: 100.0,
+            note_padding: 8.0,
+            note_corner_size: 8.0,
+        }
+    }
+}
 
 /// Render a sequence diagram to the UI.
 pub fn render_sequence_diagram(
@@ -1049,45 +2553,33 @@ pub fn render_sequence_diagram(
         return;
     }
 
-    // Layout constants
-    let participant_width = 100.0_f32;
-    let participant_height = 40.0_f32;
-    let participant_spacing = 50.0_f32;
-    let message_height = 40.0_f32;
-    let margin = 20.0_f32;
-    let lifeline_extend = 30.0_f32;
+    let layout = SeqLayout::default();
+    let colors = SeqColors::new(dark_mode);
 
-    // Calculate total size
-    let total_width = margin * 2.0 + 
-        diagram.participants.len() as f32 * participant_width +
-        (diagram.participants.len().saturating_sub(1)) as f32 * participant_spacing;
-    let total_height = margin * 2.0 + 
-        participant_height + 
-        diagram.messages.len() as f32 * message_height +
-        lifeline_extend;
-
-    // Colors
-    let (bg_color, stroke_color, text_color, lifeline_color) = if dark_mode {
-        (
-            Color32::from_rgb(45, 55, 72),
-            Color32::from_rgb(100, 140, 180),
-            Color32::from_rgb(220, 230, 240),
-            Color32::from_rgb(80, 100, 120),
-        )
-    } else {
-        (
-            Color32::from_rgb(240, 245, 250),
-            Color32::from_rgb(100, 140, 180),
-            Color32::from_rgb(30, 40, 50),
-            Color32::from_rgb(180, 190, 200),
-        )
+    // Pre-measure participant widths
+    let participant_widths: HashMap<String, f32> = {
+        let text_measurer = EguiTextMeasurer::new(ui);
+        diagram.participants.iter()
+            .map(|p| {
+                let text_size = text_measurer.measure(&p.label, font_size);
+                let width = (text_size.width * 1.15 + layout.participant_padding).max(layout.min_participant_width);
+                (p.id.clone(), width)
+            })
+            .collect()
     };
 
-    let actor_color = if dark_mode {
-        Color32::from_rgb(100, 160, 220)
-    } else {
-        Color32::from_rgb(50, 120, 180)
-    };
+    // Calculate total width based on measured participant widths
+    let total_participants_width: f32 = participant_widths.values().sum();
+    let total_width = layout.margin * 2.0 + 
+        total_participants_width +
+        (diagram.participants.len().saturating_sub(1)) as f32 * layout.participant_spacing;
+    
+    // Count total slots needed
+    let total_slots = count_statement_slots(&diagram.statements);
+    let total_height = layout.margin * 2.0 + 
+        layout.participant_height + 
+        total_slots as f32 * layout.message_height +
+        layout.lifeline_extend;
 
     // Allocate space
     let (response, painter) = ui.allocate_painter(
@@ -1096,18 +2588,32 @@ pub fn render_sequence_diagram(
     );
     let offset = response.rect.min.to_vec2();
 
-    // Calculate participant positions
+    // Calculate participant positions based on measured widths
     let mut participant_x: HashMap<String, f32> = HashMap::new();
-    let mut current_x = margin + participant_width / 2.0;
-    
+    let mut current_x = layout.margin;
+
     for participant in &diagram.participants {
-        participant_x.insert(participant.id.clone(), current_x);
-        current_x += participant_width + participant_spacing;
+        let width = participant_widths.get(&participant.id).copied().unwrap_or(layout.min_participant_width);
+        participant_x.insert(participant.id.clone(), current_x + width / 2.0);
+        current_x += width + layout.participant_spacing;
     }
 
+    // Get lifeline region boundaries (leftmost to rightmost participant)
+    let lifeline_left = diagram.participants.first()
+        .and_then(|p| participant_x.get(&p.id))
+        .copied()
+        .unwrap_or(layout.margin);
+    let lifeline_right = diagram.participants.last()
+        .and_then(|p| {
+            let x = participant_x.get(&p.id)?;
+            let w = participant_widths.get(&p.id)?;
+            Some(x + w / 2.0)
+        })
+        .unwrap_or(total_width - layout.margin);
+
     // Draw lifelines first (behind everything)
-    let lifeline_start_y = margin + participant_height;
-    let lifeline_end_y = total_height - margin;
+    let lifeline_start_y = layout.margin + layout.participant_height;
+    let lifeline_end_y = total_height - layout.margin;
     
     for participant in &diagram.participants {
         if let Some(&x) = participant_x.get(&participant.id) {
@@ -1116,7 +2622,7 @@ pub fn render_sequence_diagram(
                     Pos2::new(x, lifeline_start_y) + offset,
                     Pos2::new(x, lifeline_end_y) + offset,
                 ],
-                Stroke::new(1.0, lifeline_color),
+                Stroke::new(1.0, colors.lifeline),
             );
         }
     }
@@ -1124,118 +2630,540 @@ pub fn render_sequence_diagram(
     // Draw participants
     for participant in &diagram.participants {
         if let Some(&center_x) = participant_x.get(&participant.id) {
+            let width = participant_widths.get(&participant.id).copied().unwrap_or(layout.min_participant_width);
             let rect = Rect::from_center_size(
-                Pos2::new(center_x, margin + participant_height / 2.0) + offset,
-                Vec2::new(participant_width, participant_height),
+                Pos2::new(center_x, layout.margin + layout.participant_height / 2.0) + offset,
+                Vec2::new(width, layout.participant_height),
             );
 
             if participant.is_actor {
-                // Draw stick figure for actor
-                let head_y = rect.top() + 10.0;
-                let body_y = head_y + 15.0;
-                let legs_y = body_y + 12.0;
-                
-                // Head
-                painter.circle_stroke(Pos2::new(center_x + offset.x, head_y), 6.0, Stroke::new(2.0, actor_color));
-                // Body
-                painter.line_segment(
-                    [Pos2::new(center_x + offset.x, head_y + 6.0), Pos2::new(center_x + offset.x, body_y)],
-                    Stroke::new(2.0, actor_color),
-                );
-                // Arms
-                painter.line_segment(
-                    [Pos2::new(center_x - 10.0 + offset.x, head_y + 12.0), Pos2::new(center_x + 10.0 + offset.x, head_y + 12.0)],
-                    Stroke::new(2.0, actor_color),
-                );
-                // Legs
-                painter.line_segment(
-                    [Pos2::new(center_x + offset.x, body_y), Pos2::new(center_x - 8.0 + offset.x, legs_y)],
-                    Stroke::new(2.0, actor_color),
-                );
-                painter.line_segment(
-                    [Pos2::new(center_x + offset.x, body_y), Pos2::new(center_x + 8.0 + offset.x, legs_y)],
-                    Stroke::new(2.0, actor_color),
-                );
-                // Label below
-                painter.text(
-                    Pos2::new(center_x + offset.x, rect.bottom() - 2.0),
-                    egui::Align2::CENTER_BOTTOM,
-                    &participant.label,
-                    FontId::proportional(font_size - 2.0),
-                    text_color,
-                );
+                draw_actor(&painter, center_x, &rect, offset, &colors, font_size, &participant.label);
             } else {
-                // Draw rectangle for participant
-                painter.rect(rect, Rounding::same(4.0), bg_color, Stroke::new(2.0, stroke_color));
+                painter.rect(rect, Rounding::same(4.0), colors.bg, Stroke::new(2.0, colors.stroke));
                 painter.text(
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
                     &participant.label,
                     FontId::proportional(font_size),
-                    text_color,
+                    colors.text,
                 );
             }
         }
     }
 
-    // Draw messages
-    let mut current_y = margin + participant_height + message_height / 2.0;
+    // Draw statements (messages, blocks, notes, activations)
+    let mut current_y = layout.margin + layout.participant_height + layout.message_height / 2.0;
+    let mut activation_state: HashMap<String, ActivationState> = HashMap::new();
     
-    for message in &diagram.messages {
-        if let (Some(&from_x), Some(&to_x)) = (participant_x.get(&message.from), participant_x.get(&message.to)) {
-            let y = current_y + offset.y;
-            let from_pos = Pos2::new(from_x + offset.x, y);
-            let to_pos = Pos2::new(to_x + offset.x, y);
-            
-            // Determine stroke style
-            let stroke = match message.message_type {
-                MessageType::Solid | MessageType::SolidOpen => Stroke::new(1.5, stroke_color),
-                MessageType::Dotted | MessageType::DottedOpen => Stroke::new(1.5, stroke_color),
-            };
-
-            // Draw arrow line
-            if matches!(message.message_type, MessageType::Dotted | MessageType::DottedOpen) {
-                draw_dashed_line(&painter, from_pos, to_pos, stroke, 5.0, 3.0);
-            } else {
-                painter.line_segment([from_pos, to_pos], stroke);
-            }
-
-            // Draw arrow head (solid or open)
-            let is_solid_head = matches!(message.message_type, MessageType::Solid | MessageType::Dotted);
-            let dir = (to_pos - from_pos).normalized();
-            let arrow_size = 8.0;
-            let perp = Vec2::new(-dir.y, dir.x);
-            
-            let arrow_tip = to_pos;
-            let arrow_left = to_pos - dir * arrow_size + perp * (arrow_size * 0.4);
-            let arrow_right = to_pos - dir * arrow_size - perp * (arrow_size * 0.4);
-
-            if is_solid_head {
-                painter.add(egui::Shape::convex_polygon(
-                    vec![arrow_tip, arrow_left, arrow_right],
-                    stroke_color,
-                    Stroke::NONE,
-                ));
-            } else {
-                painter.line_segment([arrow_tip, arrow_left], stroke);
-                painter.line_segment([arrow_tip, arrow_right], stroke);
-            }
-
-            // Draw message label
-            if !message.label.is_empty() {
-                let label_pos = Pos2::new((from_x + to_x) / 2.0 + offset.x, y - 8.0);
-                painter.text(
-                    label_pos,
-                    egui::Align2::CENTER_BOTTOM,
-                    &message.label,
-                    FontId::proportional(font_size - 2.0),
-                    text_color,
+    draw_statements(
+        &painter,
+        &diagram.statements,
+        &participant_x,
+        &mut current_y,
+        offset,
+        &layout,
+        &colors,
+        font_size,
+        lifeline_left,
+        lifeline_right,
+        0, // nesting depth
+        &mut activation_state,
+    );
+    
+    // Draw any remaining open activations (extend to end of diagram)
+    let diagram_end_y = current_y;
+    for (participant_id, state) in activation_state.iter() {
+        if let Some(&x) = participant_x.get(participant_id) {
+            for (i, &start_y) in state.start_ys.iter().enumerate() {
+                let depth_offset = i as f32 * layout.activation_offset;
+                draw_activation_box(
+                    &painter,
+                    x + depth_offset,
+                    start_y,
+                    diagram_end_y,
+                    offset,
+                    &layout,
+                    &colors,
                 );
             }
-
-            current_y += message_height;
         }
     }
+}
+
+/// Draw an actor (stick figure).
+fn draw_actor(
+    painter: &egui::Painter,
+    center_x: f32,
+    rect: &Rect,
+    offset: Vec2,
+    colors: &SeqColors,
+    font_size: f32,
+    label: &str,
+) {
+    let head_y = rect.top() + 10.0;
+    let body_y = head_y + 15.0;
+    let legs_y = body_y + 12.0;
+    
+    // Head
+    painter.circle_stroke(Pos2::new(center_x + offset.x, head_y), 6.0, Stroke::new(2.0, colors.actor));
+    // Body
+    painter.line_segment(
+        [Pos2::new(center_x + offset.x, head_y + 6.0), Pos2::new(center_x + offset.x, body_y)],
+        Stroke::new(2.0, colors.actor),
+    );
+    // Arms
+    painter.line_segment(
+        [Pos2::new(center_x - 10.0 + offset.x, head_y + 12.0), Pos2::new(center_x + 10.0 + offset.x, head_y + 12.0)],
+        Stroke::new(2.0, colors.actor),
+    );
+    // Legs
+    painter.line_segment(
+        [Pos2::new(center_x + offset.x, body_y), Pos2::new(center_x - 8.0 + offset.x, legs_y)],
+        Stroke::new(2.0, colors.actor),
+    );
+    painter.line_segment(
+        [Pos2::new(center_x + offset.x, body_y), Pos2::new(center_x + 8.0 + offset.x, legs_y)],
+        Stroke::new(2.0, colors.actor),
+    );
+    // Label below
+    painter.text(
+        Pos2::new(center_x + offset.x, rect.bottom() - 2.0),
+        egui::Align2::CENTER_BOTTOM,
+        label,
+        FontId::proportional(font_size - 2.0),
+        colors.text,
+    );
+}
+
+/// Draw a message arrow between participants.
+fn draw_message(
+    painter: &egui::Painter,
+    message: &Message,
+    participant_x: &HashMap<String, f32>,
+    y: f32,
+    offset: Vec2,
+    colors: &SeqColors,
+    font_size: f32,
+) {
+    if let (Some(&from_x), Some(&to_x)) = (participant_x.get(&message.from), participant_x.get(&message.to)) {
+        let from_pos = Pos2::new(from_x + offset.x, y);
+        let to_pos = Pos2::new(to_x + offset.x, y);
+        
+        // Determine stroke style
+        let stroke = Stroke::new(1.5, colors.stroke);
+
+        // Draw arrow line
+        if matches!(message.message_type, MessageType::Dotted | MessageType::DottedOpen) {
+            draw_dashed_line(painter, from_pos, to_pos, stroke, 5.0, 3.0);
+        } else {
+            painter.line_segment([from_pos, to_pos], stroke);
+        }
+
+        // Draw arrow head (solid or open)
+        let is_solid_head = matches!(message.message_type, MessageType::Solid | MessageType::Dotted);
+        let dir = (to_pos - from_pos).normalized();
+        let arrow_size = 8.0;
+        let perp = Vec2::new(-dir.y, dir.x);
+        
+        let arrow_tip = to_pos;
+        let arrow_left = to_pos - dir * arrow_size + perp * (arrow_size * 0.4);
+        let arrow_right = to_pos - dir * arrow_size - perp * (arrow_size * 0.4);
+
+        if is_solid_head {
+            painter.add(egui::Shape::convex_polygon(
+                vec![arrow_tip, arrow_left, arrow_right],
+                colors.stroke,
+                Stroke::NONE,
+            ));
+        } else {
+            painter.line_segment([arrow_tip, arrow_left], stroke);
+            painter.line_segment([arrow_tip, arrow_right], stroke);
+        }
+
+        // Draw message label
+        if !message.label.is_empty() {
+            let label_pos = Pos2::new((from_x + to_x) / 2.0 + offset.x, y - 8.0);
+            painter.text(
+                label_pos,
+                egui::Align2::CENTER_BOTTOM,
+                &message.label,
+                FontId::proportional(font_size - 2.0),
+                colors.text,
+            );
+        }
+    }
+}
+
+/// Track activation state for a participant.
+#[derive(Default)]
+struct ActivationState {
+    /// Stack of activation start y-coordinates (for nesting)
+    start_ys: Vec<f32>,
+    /// Nesting depth offset for drawing
+    depth: usize,
+}
+
+/// Draw statements recursively (handles nested blocks).
+#[allow(clippy::too_many_arguments)]
+fn draw_statements(
+    painter: &egui::Painter,
+    statements: &[SeqStatement],
+    participant_x: &HashMap<String, f32>,
+    current_y: &mut f32,
+    offset: Vec2,
+    layout: &SeqLayout,
+    colors: &SeqColors,
+    font_size: f32,
+    lifeline_left: f32,
+    lifeline_right: f32,
+    depth: usize,
+    activation_state: &mut HashMap<String, ActivationState>,
+) {
+    for stmt in statements {
+        match stmt {
+            SeqStatement::Message(message) => {
+                let y = *current_y + offset.y;
+                
+                // Handle activation on message target
+                if message.activate_target {
+                    let state = activation_state.entry(message.to.clone()).or_default();
+                    state.start_ys.push(*current_y);
+                    state.depth += 1;
+                }
+                
+                draw_message(painter, message, participant_x, y, offset, colors, font_size);
+                *current_y += layout.message_height;
+                
+                // Handle deactivation on message target
+                if message.deactivate_target {
+                    if let Some(state) = activation_state.get_mut(&message.to) {
+                        if let Some(start_y) = state.start_ys.pop() {
+                            if let Some(&x) = participant_x.get(&message.to) {
+                                let depth_offset = state.depth.saturating_sub(1) as f32 * layout.activation_offset;
+                                draw_activation_box(
+                                    painter,
+                                    x + depth_offset,
+                                    start_y,
+                                    *current_y,
+                                    offset,
+                                    layout,
+                                    colors,
+                                );
+                            }
+                            state.depth = state.depth.saturating_sub(1);
+                        }
+                    }
+                }
+            }
+            SeqStatement::Note(note) => {
+                let y = *current_y + offset.y;
+                draw_note(painter, note, participant_x, y, offset, layout, colors, font_size);
+                *current_y += layout.message_height;
+            }
+            SeqStatement::Activate(participant_id) => {
+                let state = activation_state.entry(participant_id.clone()).or_default();
+                state.start_ys.push(*current_y);
+                state.depth += 1;
+            }
+            SeqStatement::Deactivate(participant_id) => {
+                if let Some(state) = activation_state.get_mut(participant_id) {
+                    if let Some(start_y) = state.start_ys.pop() {
+                        if let Some(&x) = participant_x.get(participant_id) {
+                            let depth_offset = state.depth.saturating_sub(1) as f32 * layout.activation_offset;
+                            draw_activation_box(
+                                painter,
+                                x + depth_offset,
+                                start_y,
+                                *current_y,
+                                offset,
+                                layout,
+                                colors,
+                            );
+                        }
+                        state.depth = state.depth.saturating_sub(1);
+                    }
+                }
+            }
+            SeqStatement::Block(block) => {
+                draw_block(
+                    painter,
+                    block,
+                    participant_x,
+                    current_y,
+                    offset,
+                    layout,
+                    colors,
+                    font_size,
+                    lifeline_left,
+                    lifeline_right,
+                    depth,
+                    activation_state,
+                );
+            }
+        }
+    }
+}
+
+/// Draw an activation box on a lifeline.
+fn draw_activation_box(
+    painter: &egui::Painter,
+    x: f32,
+    start_y: f32,
+    end_y: f32,
+    offset: Vec2,
+    layout: &SeqLayout,
+    colors: &SeqColors,
+) {
+    let rect = Rect::from_min_max(
+        Pos2::new(x - layout.activation_width / 2.0, start_y) + offset,
+        Pos2::new(x + layout.activation_width / 2.0, end_y) + offset,
+    );
+    
+    painter.rect(
+        rect,
+        Rounding::same(2.0),
+        colors.activation_fill,
+        Stroke::new(1.5, colors.activation_stroke),
+    );
+}
+
+/// Draw a note in a sequence diagram.
+fn draw_note(
+    painter: &egui::Painter,
+    note: &SeqNote,
+    participant_x: &HashMap<String, f32>,
+    y: f32,
+    offset: Vec2,
+    layout: &SeqLayout,
+    colors: &SeqColors,
+    font_size: f32,
+) {
+    // Calculate note position based on NotePosition
+    let (note_x, note_width) = match &note.position {
+        NotePosition::LeftOf(participant) => {
+            if let Some(&x) = participant_x.get(participant) {
+                (x - layout.note_width - layout.participant_spacing / 2.0, layout.note_width)
+            } else {
+                return;
+            }
+        }
+        NotePosition::RightOf(participant) => {
+            if let Some(&x) = participant_x.get(participant) {
+                (x + layout.participant_spacing / 2.0, layout.note_width)
+            } else {
+                return;
+            }
+        }
+        NotePosition::Over(participants) => {
+            if participants.is_empty() {
+                return;
+            }
+            
+            let xs: Vec<f32> = participants.iter()
+                .filter_map(|id| participant_x.get(id).copied())
+                .collect();
+            
+            if xs.is_empty() {
+                return;
+            }
+            
+            let min_x = xs.iter().copied().fold(f32::INFINITY, f32::min);
+            let max_x = xs.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let width = (max_x - min_x).max(layout.note_width);
+            let center_x = (min_x + max_x) / 2.0;
+            
+            (center_x - width / 2.0, width)
+        }
+    };
+    
+    let note_height = layout.message_height - layout.note_padding;
+    let note_rect = Rect::from_min_size(
+        Pos2::new(note_x, y - note_height / 2.0) + offset,
+        Vec2::new(note_width, note_height),
+    );
+    
+    // Draw note background with dog-ear corner
+    let corner = layout.note_corner_size;
+    let points = vec![
+        note_rect.left_top(),
+        Pos2::new(note_rect.right() - corner, note_rect.top()),
+        Pos2::new(note_rect.right(), note_rect.top() + corner),
+        note_rect.right_bottom(),
+        note_rect.left_bottom(),
+    ];
+    
+    painter.add(egui::Shape::convex_polygon(
+        points,
+        colors.note_fill,
+        Stroke::new(1.0, colors.note_stroke),
+    ));
+    
+    // Draw the dog-ear fold line
+    painter.line_segment(
+        [
+            Pos2::new(note_rect.right() - corner, note_rect.top()),
+            Pos2::new(note_rect.right() - corner, note_rect.top() + corner),
+        ],
+        Stroke::new(1.0, colors.note_stroke),
+    );
+    painter.line_segment(
+        [
+            Pos2::new(note_rect.right() - corner, note_rect.top() + corner),
+            Pos2::new(note_rect.right(), note_rect.top() + corner),
+        ],
+        Stroke::new(1.0, colors.note_stroke),
+    );
+    
+    // Draw note text
+    painter.text(
+        note_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        &note.text,
+        FontId::proportional(font_size - 2.0),
+        colors.note_text,
+    );
+}
+
+/// Draw a control-flow block (loop, alt, opt, par).
+#[allow(clippy::too_many_arguments)]
+fn draw_block(
+    painter: &egui::Painter,
+    block: &SeqBlock,
+    participant_x: &HashMap<String, f32>,
+    current_y: &mut f32,
+    offset: Vec2,
+    layout: &SeqLayout,
+    colors: &SeqColors,
+    font_size: f32,
+    lifeline_left: f32,
+    lifeline_right: f32,
+    depth: usize,
+    activation_state: &mut HashMap<String, ActivationState>,
+) {
+    // Calculate block height by counting all slots
+    let mut block_height = layout.block_label_height; // Header
+    for (i, segment) in block.segments.iter().enumerate() {
+        let segment_slots = count_statement_slots(&segment.statements);
+        block_height += segment_slots as f32 * layout.message_height;
+        // Add separator height between segments (except for last)
+        if i < block.segments.len() - 1 {
+            block_height += layout.block_label_height;
+        }
+    }
+    block_height += layout.block_padding * 2.0; // Footer padding
+    
+    // Inset the block based on nesting depth
+    let inset = depth as f32 * layout.block_padding * 2.0;
+    let block_left = lifeline_left - layout.block_padding * 4.0 + inset;
+    let block_right = lifeline_right + layout.block_padding * 4.0 - inset;
+    let block_width = block_right - block_left;
+    
+    let block_top_y = *current_y - layout.message_height / 2.0 + layout.block_padding;
+    
+    // Draw block background
+    let block_rect = Rect::from_min_size(
+        Pos2::new(block_left, block_top_y) + offset,
+        Vec2::new(block_width, block_height),
+    );
+    
+    let fill_color = colors.block_fill(&block.kind);
+    painter.rect(
+        block_rect,
+        Rounding::same(4.0),
+        fill_color,
+        Stroke::new(1.5, colors.block_stroke),
+    );
+    
+    // Draw block label in top-left corner with background
+    let label_text = format!("{}", block.kind.display_name());
+    let label_with_bracket = if block.label.is_empty() {
+        label_text
+    } else {
+        format!("{} [{}]", label_text, block.label)
+    };
+    
+    let label_rect = Rect::from_min_size(
+        Pos2::new(block_left, block_top_y) + offset,
+        Vec2::new(label_with_bracket.len() as f32 * 7.0 + 12.0, layout.block_label_height),
+    );
+    
+    // Draw label background (pentagon shape approximated as rectangle with clipped corner)
+    painter.rect_filled(
+        label_rect,
+        Rounding::ZERO,
+        colors.block_stroke,
+    );
+    
+    // Draw label text
+    painter.text(
+        label_rect.left_center() + Vec2::new(6.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        &label_with_bracket,
+        FontId::proportional(font_size - 3.0),
+        Color32::WHITE,
+    );
+    
+    // Move past the header
+    *current_y += layout.block_label_height;
+    
+    // Draw segments
+    for (i, segment) in block.segments.iter().enumerate() {
+        // Draw segment label (for alt/par segments after the first)
+        if i > 0 {
+            // Draw separator line
+            let sep_y = *current_y - layout.message_height / 2.0 + offset.y;
+            painter.line_segment(
+                [
+                    Pos2::new(block_left + offset.x, sep_y),
+                    Pos2::new(block_right + offset.x, sep_y),
+                ],
+                Stroke::new(1.0, colors.block_stroke),
+            );
+            
+            // Draw segment label
+            let segment_label_text = if let Some(label) = &segment.segment_label {
+                Some(format!("[{}]", label))
+            } else {
+                // Default labels for block types
+                match block.kind {
+                    SeqBlockKind::Alt => Some("[else]".to_string()),
+                    SeqBlockKind::Par => Some("[and]".to_string()),
+                    _ => None,
+                }
+            };
+            
+            if let Some(text) = segment_label_text {
+                painter.text(
+                    Pos2::new(block_left + 10.0 + offset.x, sep_y + 2.0),
+                    egui::Align2::LEFT_TOP,
+                    &text,
+                    FontId::proportional(font_size - 3.0),
+                    colors.block_text,
+                );
+            }
+            
+            *current_y += layout.block_label_height;
+        }
+        
+        // Draw statements in this segment
+        draw_statements(
+            painter,
+            &segment.statements,
+            participant_x,
+            current_y,
+            offset,
+            layout,
+            colors,
+            font_size,
+            lifeline_left,
+            lifeline_right,
+            depth + 1,
+            activation_state,
+        );
+    }
+    
+    // Add footer padding
+    *current_y += layout.block_padding * 2.0;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1434,13 +3362,125 @@ pub fn render_pie_chart(
 // State Diagram Types and Renderer
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A state in a state diagram.
+/// A state in a state diagram, supporting composite/nested states.
 #[derive(Debug, Clone)]
 pub struct State {
     pub id: String,
     pub label: String,
     pub is_start: bool,
     pub is_end: bool,
+    /// Child states for composite states (empty for simple states)
+    pub children: Vec<State>,
+    /// Internal transitions within this composite state
+    pub internal_transitions: Vec<Transition>,
+    /// Parent state ID if this is a nested state
+    pub parent: Option<String>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            label: String::new(),
+            is_start: false,
+            is_end: false,
+            children: Vec::new(),
+            internal_transitions: Vec::new(),
+            parent: None,
+        }
+    }
+}
+
+impl State {
+    /// Create a new simple state
+    pub fn new(id: impl Into<String>, label: impl Into<String>) -> Self {
+        let id = id.into();
+        let label = label.into();
+        Self {
+            id,
+            label,
+            ..Default::default()
+        }
+    }
+
+    /// Create a start state
+    pub fn start() -> Self {
+        Self {
+            id: "__start__".to_string(),
+            label: "●".to_string(),
+            is_start: true,
+            ..Default::default()
+        }
+    }
+
+    /// Create an end state
+    pub fn end() -> Self {
+        Self {
+            id: "__end__".to_string(),
+            label: "◉".to_string(),
+            is_end: true,
+            ..Default::default()
+        }
+    }
+
+    /// Check if this is a composite (has children)
+    pub fn is_composite(&self) -> bool {
+        !self.children.is_empty()
+    }
+
+    /// Get all nested states recursively (including self)
+    pub fn all_states(&self) -> Vec<&State> {
+        let mut result = vec![self];
+        for child in &self.children {
+            result.extend(child.all_states());
+        }
+        result
+    }
+
+    /// Find a state by ID within this state's subtree
+    pub fn find_state(&self, id: &str) -> Option<&State> {
+        if self.id == id {
+            return Some(self);
+        }
+        for child in &self.children {
+            if let Some(found) = child.find_state(id) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    /// Find a mutable state by ID within this state's subtree
+    pub fn find_state_mut(&mut self, id: &str) -> Option<&mut State> {
+        if self.id == id {
+            return Some(self);
+        }
+        for child in &mut self.children {
+            if let Some(found) = child.find_state_mut(id) {
+                return Some(found);
+            }
+        }
+        None
+    }
+}
+
+/// The kind of transition based on hierarchy relationship.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransitionKind {
+    /// Both source and target are in the same scope (same composite or both top-level)
+    Internal,
+    /// Transition enters a composite state from outside
+    Enter,
+    /// Transition exits a composite state to outside
+    Exit,
+    /// Transition crosses between different branches of the hierarchy
+    CrossHierarchy,
+}
+
+impl Default for TransitionKind {
+    fn default() -> Self {
+        Self::Internal
+    }
 }
 
 /// A transition between states.
@@ -1449,24 +3489,273 @@ pub struct Transition {
     pub from: String,
     pub to: String,
     pub label: Option<String>,
+    /// The kind of transition (computed during normalization)
+    pub kind: TransitionKind,
+    /// Source state's enclosing composite (None if top-level)
+    pub source_scope: Option<String>,
+    /// Target state's enclosing composite (None if top-level)
+    pub target_scope: Option<String>,
+    /// Lowest common ancestor composite for source and target (None if both top-level)
+    pub lca_scope: Option<String>,
+}
+
+impl Transition {
+    /// Create a new transition with default kind (will be computed later)
+    pub fn new(from: String, to: String, label: Option<String>) -> Self {
+        Self {
+            from,
+            to,
+            label,
+            kind: TransitionKind::Internal,
+            source_scope: None,
+            target_scope: None,
+            lca_scope: None,
+        }
+    }
+}
+
+/// Configuration options for state diagram layout.
+#[derive(Debug, Clone)]
+pub struct StateDiagramConfig {
+    /// Padding inside composite states
+    pub composite_padding: f32,
+    /// Height of the header/title bar in composite states
+    pub header_height: f32,
+    /// Horizontal spacing between child states
+    pub child_spacing_x: f32,
+    /// Vertical spacing between child states
+    pub child_spacing_y: f32,
+    /// Minimum width for simple states
+    pub min_state_width: f32,
+    /// Height for simple states
+    pub state_height: f32,
+    /// Horizontal spacing between top-level states
+    pub spacing_x: f32,
+    /// Vertical spacing between top-level states
+    pub spacing_y: f32,
+    /// Margin around the entire diagram
+    pub margin: f32,
+    /// Whether to use orthogonal routing for cross-hierarchy transitions
+    pub orthogonal_cross_routing: bool,
+    /// Preferred anchor side for cross-hierarchy exits (true = left/right, false = top/bottom)
+    pub prefer_horizontal_anchors: bool,
+}
+
+impl Default for StateDiagramConfig {
+    fn default() -> Self {
+        Self {
+            composite_padding: 20.0,
+            header_height: 28.0,
+            child_spacing_x: 80.0,
+            child_spacing_y: 56.0,
+            min_state_width: 80.0,
+            state_height: 36.0,
+            spacing_x: 100.0,
+            spacing_y: 70.0,
+            margin: 40.0,
+            orthogonal_cross_routing: true,
+            prefer_horizontal_anchors: true,
+        }
+    }
 }
 
 /// A parsed state diagram.
 #[derive(Debug, Clone, Default)]
 pub struct StateDiagram {
+    /// Top-level states (may contain nested children)
     pub states: Vec<State>,
+    /// Top-level transitions (between top-level states or across hierarchy)
     pub transitions: Vec<Transition>,
+    /// Layout configuration
+    pub config: StateDiagramConfig,
 }
 
 /// Parse mermaid state diagram source.
 pub fn parse_state_diagram(source: &str) -> Result<StateDiagram, String> {
+    let lines: Vec<&str> = source.lines().skip(1).collect();
     let mut diagram = StateDiagram::default();
+    let mut idx = 0;
+
+    parse_state_diagram_block(&lines, &mut idx, &mut diagram.states, &mut diagram.transitions, None)?;
+
+    if diagram.states.is_empty() {
+        return Err("No states found in state diagram".to_string());
+    }
+
+    // Normalize transitions: compute kinds, scopes, and LCA
+    normalize_state_diagram(&mut diagram);
+
+    Ok(diagram)
+}
+
+/// Normalize a state diagram by computing transition metadata.
+fn normalize_state_diagram(diagram: &mut StateDiagram) {
+    // Build a map of state ID to its ancestry chain (list of parent IDs from root to immediate parent)
+    let mut ancestry_map: HashMap<String, Vec<String>> = HashMap::new();
+    build_ancestry_map(&diagram.states, &[], &mut ancestry_map);
+
+    // Normalize top-level transitions
+    for transition in &mut diagram.transitions {
+        normalize_transition(transition, &ancestry_map);
+    }
+
+    // Normalize internal transitions recursively
+    normalize_internal_transitions(&mut diagram.states, &ancestry_map);
+}
+
+/// Build ancestry map for all states recursively.
+fn build_ancestry_map(
+    states: &[State],
+    current_ancestry: &[String],
+    ancestry_map: &mut HashMap<String, Vec<String>>,
+) {
+    for state in states {
+        ancestry_map.insert(state.id.clone(), current_ancestry.to_vec());
+        
+        if state.is_composite() {
+            // Build ancestry for children - add current state to ancestry chain
+            let mut child_ancestry = current_ancestry.to_vec();
+            child_ancestry.push(state.id.clone());
+            build_ancestry_map(&state.children, &child_ancestry, ancestry_map);
+        }
+    }
+}
+
+/// Normalize internal transitions for all composite states recursively.
+fn normalize_internal_transitions(
+    states: &mut [State],
+    ancestry_map: &HashMap<String, Vec<String>>,
+) {
+    for state in states {
+        for transition in &mut state.internal_transitions {
+            normalize_transition(transition, ancestry_map);
+        }
+        normalize_internal_transitions(&mut state.children, ancestry_map);
+    }
+}
+
+/// Normalize a single transition by computing its kind and scope metadata.
+fn normalize_transition(
+    transition: &mut Transition,
+    ancestry_map: &HashMap<String, Vec<String>>,
+) {
+    let source_ancestry = ancestry_map.get(&transition.from).cloned().unwrap_or_default();
+    let target_ancestry = ancestry_map.get(&transition.to).cloned().unwrap_or_default();
+
+    // Set source and target scopes (immediate parent)
+    transition.source_scope = source_ancestry.last().cloned();
+    transition.target_scope = target_ancestry.last().cloned();
+
+    // Compute LCA (lowest common ancestor)
+    transition.lca_scope = find_lca(&source_ancestry, &target_ancestry);
+
+    // Determine transition kind
+    transition.kind = if transition.source_scope == transition.target_scope {
+        // Same scope - either both top-level or both in same composite
+        TransitionKind::Internal
+    } else if source_ancestry.is_empty() && !target_ancestry.is_empty() {
+        // Source is top-level, target is inside a composite
+        TransitionKind::Enter
+    } else if !source_ancestry.is_empty() && target_ancestry.is_empty() {
+        // Source is inside a composite, target is top-level
+        TransitionKind::Exit
+    } else if is_ancestor_of(&source_ancestry, &transition.to) {
+        // Source is ancestor of target - entering deeper
+        TransitionKind::Enter
+    } else if is_ancestor_of(&target_ancestry, &transition.from) {
+        // Target is ancestor of source - exiting
+        TransitionKind::Exit
+    } else {
+        // Different branches of hierarchy
+        TransitionKind::CrossHierarchy
+    };
+}
+
+/// Find the lowest common ancestor of two ancestry chains.
+fn find_lca(ancestry_a: &[String], ancestry_b: &[String]) -> Option<String> {
+    let mut lca = None;
+    for (a, b) in ancestry_a.iter().zip(ancestry_b.iter()) {
+        if a == b {
+            lca = Some(a.clone());
+        } else {
+            break;
+        }
+    }
+    lca
+}
+
+/// Check if the given ancestry chain contains a specific state ID.
+fn is_ancestor_of(ancestry: &[String], state_id: &str) -> bool {
+    ancestry.iter().any(|a| a == state_id)
+}
+
+/// Parse a block of state diagram content (recursive for nested states).
+fn parse_state_diagram_block(
+    lines: &[&str],
+    idx: &mut usize,
+    states: &mut Vec<State>,
+    transitions: &mut Vec<Transition>,
+    parent_id: Option<&str>,
+) -> Result<(), String> {
     let mut state_map: HashMap<String, usize> = HashMap::new();
 
-    for line in source.lines().skip(1) {
-        let line = line.trim();
-        
+    // Build initial state map from existing states
+    for (i, state) in states.iter().enumerate() {
+        state_map.insert(state.id.clone(), i);
+    }
+
+    while *idx < lines.len() {
+        let line = lines[*idx].trim();
+        *idx += 1;
+
         if line.is_empty() || line.starts_with("%%") {
+            continue;
+        }
+
+        // End of composite block
+        if line == "}" {
+            return Ok(());
+        }
+
+        // Parse composite state: state StateName { or state "Label" as StateName {
+        if line.starts_with("state ") && line.ends_with('{') {
+            let rest = line[6..].trim_end_matches('{').trim();
+            
+            // Parse state name/label - handle both "state Name {" and "state "Label" as Name {"
+            let (state_id, state_label) = if let Some(as_pos) = rest.find(" as ") {
+                let label = rest[..as_pos].trim().trim_matches('"').to_string();
+                let id = rest[as_pos + 4..].trim().to_string();
+                (id, label)
+            } else {
+                let id = rest.trim_matches('"').to_string();
+                (id.clone(), id)
+            };
+
+            // Create composite state
+            let mut composite = State {
+                id: state_id.clone(),
+                label: state_label,
+                parent: parent_id.map(|s| s.to_string()),
+                ..Default::default()
+            };
+
+            // Recursively parse the composite block
+            parse_state_diagram_block(
+                lines,
+                idx,
+                &mut composite.children,
+                &mut composite.internal_transitions,
+                Some(&state_id),
+            )?;
+
+            // Set parent reference for all children
+            for child in &mut composite.children {
+                child.parent = Some(state_id.clone());
+            }
+
+            let state_idx = states.len();
+            state_map.insert(state_id.clone(), state_idx);
+            states.push(composite);
             continue;
         }
 
@@ -1493,41 +3782,131 @@ pub fn parse_state_diagram(source: &str) -> Result<StateDiagram, String> {
                     (&to_id, false, to_part == "[*]"),
                 ] {
                     if !state_map.contains_key(id) {
-                        state_map.insert(id.clone(), diagram.states.len());
-                        let label = if is_start { "●".to_string() } 
+                        let state_label = if is_start { "●".to_string() } 
                                    else if is_end { "◉".to_string() }
                                    else { id.clone() };
-                        diagram.states.push(State {
+                        let state_idx = states.len();
+                        state_map.insert(id.clone(), state_idx);
+                        states.push(State {
                             id: id.clone(),
-                            label,
+                            label: state_label,
                             is_start,
                             is_end,
+                            parent: parent_id.map(|s| s.to_string()),
+                            ..Default::default()
                         });
                     }
                 }
 
-                diagram.transitions.push(Transition { from: from_id, to: to_id, label });
+                transitions.push(Transition::new(from_id, to_id, label));
             }
+            continue;
         }
-        // Parse state definition: state "Label" as StateName
-        else if line.starts_with("state ") {
-            let rest = &line[6..].trim();
+
+        // Parse simple state definition: state "Label" as StateName
+        if line.starts_with("state ") {
+            let rest = line[6..].trim();
             if let Some(as_pos) = rest.find(" as ") {
                 let label = rest[..as_pos].trim().trim_matches('"').to_string();
                 let id = rest[as_pos + 4..].trim().to_string();
                 if !state_map.contains_key(&id) {
-                    state_map.insert(id.clone(), diagram.states.len());
-                    diagram.states.push(State { id, label, is_start: false, is_end: false });
+                    let state_idx = states.len();
+                    state_map.insert(id.clone(), state_idx);
+                    states.push(State {
+                        id: id.clone(),
+                        label,
+                        parent: parent_id.map(|s| s.to_string()),
+                        ..Default::default()
+                    });
+                }
+            } else {
+                // Simple state definition: state StateName
+                let id = rest.trim_matches('"').to_string();
+                if !state_map.contains_key(&id) {
+                    let state_idx = states.len();
+                    state_map.insert(id.clone(), state_idx);
+                    states.push(State {
+                        id: id.clone(),
+                        label: id.clone(),
+                        parent: parent_id.map(|s| s.to_string()),
+                        ..Default::default()
+                    });
                 }
             }
         }
     }
 
-    if diagram.states.is_empty() {
-        return Err("No states found in state diagram".to_string());
+    Ok(())
+}
+
+/// Layout information for a state.
+#[derive(Debug, Clone)]
+struct StateLayout {
+    /// Center position of the state
+    center: Pos2,
+    /// Size of the state (width, height) - larger for composites
+    size: Vec2,
+    /// For composites: bounding rect including title bar
+    bounds: Rect,
+    /// Whether this is a composite state
+    is_composite: bool,
+}
+
+/// Colors for state diagram rendering.
+struct StateDiagramColors {
+    state_fill: Color32,
+    state_stroke: Color32,
+    composite_fill: Color32,
+    composite_title_bg: Color32,
+    text_color: Color32,
+    arrow_color: Color32,
+    /// Color for cross-hierarchy transitions (visually distinct)
+    cross_arrow_color: Color32,
+    /// Color for enter/exit transitions
+    boundary_arrow_color: Color32,
+    start_color: Color32,
+    label_bg: Color32,
+}
+
+impl StateDiagramColors {
+    fn new(dark_mode: bool) -> Self {
+        if dark_mode {
+            Self {
+                state_fill: Color32::from_rgb(45, 55, 72),
+                state_stroke: Color32::from_rgb(100, 140, 180),
+                composite_fill: Color32::from_rgba_unmultiplied(40, 50, 65, 200),
+                composite_title_bg: Color32::from_rgb(55, 70, 90),
+                text_color: Color32::from_rgb(220, 230, 240),
+                arrow_color: Color32::from_rgb(120, 150, 180),
+                cross_arrow_color: Color32::from_rgb(180, 120, 150), // Slightly pink for cross-hierarchy
+                boundary_arrow_color: Color32::from_rgb(150, 180, 120), // Slightly green for boundary crossing
+                start_color: Color32::from_rgb(80, 180, 120),
+                label_bg: Color32::from_rgb(35, 40, 50),
+            }
+        } else {
+            Self {
+                state_fill: Color32::from_rgb(240, 245, 250),
+                state_stroke: Color32::from_rgb(100, 140, 180),
+                composite_fill: Color32::from_rgba_unmultiplied(235, 240, 250, 220),
+                composite_title_bg: Color32::from_rgb(220, 230, 245),
+                text_color: Color32::from_rgb(30, 40, 50),
+                arrow_color: Color32::from_rgb(100, 130, 160),
+                cross_arrow_color: Color32::from_rgb(160, 100, 130), // Slightly pink for cross-hierarchy
+                boundary_arrow_color: Color32::from_rgb(100, 140, 100), // Slightly green for boundary crossing
+                start_color: Color32::from_rgb(50, 150, 80),
+                label_bg: Color32::from_rgb(255, 255, 255),
+            }
+        }
     }
 
-    Ok(diagram)
+    /// Get the appropriate arrow color for a transition kind.
+    fn arrow_color_for_kind(&self, kind: TransitionKind) -> Color32 {
+        match kind {
+            TransitionKind::Internal => self.arrow_color,
+            TransitionKind::Enter | TransitionKind::Exit => self.boundary_arrow_color,
+            TransitionKind::CrossHierarchy => self.cross_arrow_color,
+        }
+    }
 }
 
 /// Render a state diagram to the UI.
@@ -1541,176 +3920,511 @@ pub fn render_state_diagram(
         return;
     }
 
-    // Layout: use topological sort similar to flowchart
-    let state_width = 100.0_f32;
-    let state_height = 36.0_f32;
-    let spacing_x = 80.0_f32;
-    let spacing_y = 70.0_f32;
-    let margin = 30.0_f32;
+    let colors = StateDiagramColors::new(dark_mode);
+    let config = &diagram.config;
+    let label_font_size = font_size - 2.0;
+    let state_padding = Vec2::new(24.0, 12.0);
+    let min_state_width = config.min_state_width;
+    let state_height = config.state_height;
+    let spacing_x = config.spacing_x;
+    let spacing_y = config.spacing_y;
+    let margin = config.margin;
+    let composite_padding = config.composite_padding;
+    let title_bar_height = config.header_height;
 
-    // Build adjacency for layer assignment
-    let mut outgoing: HashMap<String, Vec<String>> = HashMap::new();
-    let mut incoming: HashMap<String, Vec<String>> = HashMap::new();
-    
-    for state in &diagram.states {
-        outgoing.insert(state.id.clone(), Vec::new());
-        incoming.insert(state.id.clone(), Vec::new());
-    }
-    
-    for trans in &diagram.transitions {
-        if let Some(out) = outgoing.get_mut(&trans.from) {
-            out.push(trans.to.clone());
+    // Collect all states recursively for measurement
+    fn collect_all_states(states: &[State]) -> Vec<&State> {
+        let mut result = Vec::new();
+        for state in states {
+            result.push(state);
+            result.extend(collect_all_states(&state.children));
         }
-        if let Some(inc) = incoming.get_mut(&trans.to) {
-            inc.push(trans.from.clone());
-        }
+        result
     }
 
-    // Assign layers
-    let mut layers: Vec<Vec<String>> = Vec::new();
-    let mut state_layer: HashMap<String, usize> = HashMap::new();
-    let mut remaining: Vec<String> = diagram.states.iter().map(|s| s.id.clone()).collect();
+    let all_states = collect_all_states(&diagram.states);
 
-    while !remaining.is_empty() {
-        let layer_states: Vec<String> = remaining
-            .iter()
-            .filter(|id| {
-                incoming.get(*id).map_or(true, |inc| {
-                    inc.iter().all(|from| state_layer.contains_key(from))
-                })
+    // Measure state labels to determine proper widths
+    let state_widths: HashMap<String, f32> = {
+        let text_measurer = EguiTextMeasurer::new(ui);
+        all_states.iter()
+            .filter(|s| !s.is_start && !s.is_end)
+            .map(|state| {
+                let text_size = text_measurer.measure(&state.label, font_size);
+                let width = (text_size.width * 1.15 + state_padding.x).max(min_state_width);
+                (state.id.clone(), width)
             })
-            .cloned()
-            .collect();
-
-        if layer_states.is_empty() {
-            // Cycle - just add remaining
-            for id in remaining.drain(..) {
-                let idx = layers.len();
-                state_layer.insert(id.clone(), idx);
-                if layers.len() <= idx { layers.push(Vec::new()); }
-                layers[idx].push(id);
-            }
-            break;
-        }
-
-        let idx = layers.len();
-        layers.push(layer_states.clone());
-        for id in &layer_states {
-            state_layer.insert(id.clone(), idx);
-            remaining.retain(|r| r != id);
-        }
-    }
-
-    // Calculate positions
-    let mut state_pos: HashMap<String, Pos2> = HashMap::new();
-    let mut max_x = 0.0_f32;
-    let mut max_y = 0.0_f32;
-
-    for (layer_idx, layer) in layers.iter().enumerate() {
-        let x = margin + layer_idx as f32 * (state_width + spacing_x) + state_width / 2.0;
-        let layer_height = layer.len() as f32 * (state_height + spacing_y) - spacing_y;
-        let start_y = margin + (if layer.len() > 1 { 0.0 } else { spacing_y / 2.0 });
-
-        for (i, id) in layer.iter().enumerate() {
-            let y = start_y + i as f32 * (state_height + spacing_y) + state_height / 2.0;
-            state_pos.insert(id.clone(), Pos2::new(x, y));
-            max_x = max_x.max(x + state_width / 2.0);
-            max_y = max_y.max(y + state_height / 2.0);
-        }
-    }
-
-    let total_width = max_x + margin;
-    let total_height = max_y + margin;
-
-    // Colors
-    let (state_fill, state_stroke, text_color, arrow_color, start_color, label_bg) = if dark_mode {
-        (
-            Color32::from_rgb(45, 55, 72),
-            Color32::from_rgb(100, 140, 180),
-            Color32::from_rgb(220, 230, 240),
-            Color32::from_rgb(120, 150, 180),
-            Color32::from_rgb(80, 180, 120),
-            Color32::from_rgb(35, 40, 50),
-        )
-    } else {
-        (
-            Color32::from_rgb(240, 245, 250),
-            Color32::from_rgb(100, 140, 180),
-            Color32::from_rgb(30, 40, 50),
-            Color32::from_rgb(100, 130, 160),
-            Color32::from_rgb(50, 150, 80),
-            Color32::from_rgb(255, 255, 255),
-        )
+            .collect()
     };
 
+    // Collect all transitions (top-level and internal)
+    fn collect_all_transitions<'a>(states: &'a [State], transitions: &'a [Transition]) -> Vec<&'a Transition> {
+        let mut result: Vec<&'a Transition> = transitions.iter().collect();
+        for state in states {
+            result.extend(state.internal_transitions.iter());
+            result.extend(collect_all_transitions(&state.children, &state.internal_transitions));
+        }
+        result
+    }
+
+    let all_transitions = collect_all_transitions(&diagram.states, &diagram.transitions);
+
+    // Measure transition labels
+    let transition_labels: HashMap<(String, String), (String, Vec2)> = {
+        let text_measurer = EguiTextMeasurer::new(ui);
+        all_transitions.iter()
+            .filter_map(|trans| {
+                trans.label.as_ref().map(|label| {
+                    let text_size = text_measurer.measure(label, label_font_size);
+                    let label_padding = Vec2::new(24.0, 10.0);
+                    let size = Vec2::new(
+                        text_size.width * 1.15 + label_padding.x,
+                        text_size.height + label_padding.y,
+                    );
+                    ((trans.from.clone(), trans.to.clone()), (label.clone(), size))
+                })
+            })
+            .collect()
+    };
+
+    // Layout states using recursive approach for nested states
+    let mut state_layouts: HashMap<String, StateLayout> = HashMap::new();
+
+    /// Recursive layout function for a set of states
+    fn layout_states(
+        states: &[State],
+        transitions: &[Transition],
+        state_widths: &HashMap<String, f32>,
+        min_state_width: f32,
+        state_height: f32,
+        spacing_x: f32,
+        spacing_y: f32,
+        composite_padding: f32,
+        title_bar_height: f32,
+        start_pos: Pos2,
+        layouts: &mut HashMap<String, StateLayout>,
+    ) -> Vec2 {
+        if states.is_empty() {
+            return Vec2::ZERO;
+        }
+
+        // First, recursively layout children of composite states
+        let mut composite_sizes: HashMap<String, Vec2> = HashMap::new();
+        for state in states {
+            if state.is_composite() {
+                let child_size = layout_states(
+                    &state.children,
+                    &state.internal_transitions,
+                    state_widths,
+                    min_state_width,
+                    state_height,
+                    spacing_x * 0.8, // Tighter spacing for nested
+                    spacing_y * 0.8,
+                    composite_padding,
+                    title_bar_height,
+                    Pos2::ZERO, // Will be repositioned later
+                    layouts,
+                );
+                // Composite size = child bounds + padding + title bar
+                let comp_width = (child_size.x + composite_padding * 2.0).max(state_widths.get(&state.id).copied().unwrap_or(min_state_width) + composite_padding * 2.0);
+                let comp_height = child_size.y + composite_padding * 2.0 + title_bar_height;
+                composite_sizes.insert(state.id.clone(), Vec2::new(comp_width, comp_height));
+            }
+        }
+
+        // Build adjacency for layer assignment at this level
+        let mut outgoing: HashMap<String, Vec<String>> = HashMap::new();
+        let mut incoming: HashMap<String, Vec<String>> = HashMap::new();
+        
+        for state in states {
+            outgoing.insert(state.id.clone(), Vec::new());
+            incoming.insert(state.id.clone(), Vec::new());
+        }
+        
+        for trans in transitions {
+            // Only consider transitions between states at this level
+            if states.iter().any(|s| s.id == trans.from) && states.iter().any(|s| s.id == trans.to) {
+                if let Some(out) = outgoing.get_mut(&trans.from) {
+                    out.push(trans.to.clone());
+                }
+                if let Some(inc) = incoming.get_mut(&trans.to) {
+                    inc.push(trans.from.clone());
+                }
+            }
+        }
+
+        // Assign layers
+        let mut layers: Vec<Vec<String>> = Vec::new();
+        let mut state_layer: HashMap<String, usize> = HashMap::new();
+        let mut remaining: Vec<String> = states.iter().map(|s| s.id.clone()).collect();
+
+        while !remaining.is_empty() {
+            let layer_states: Vec<String> = remaining
+                .iter()
+                .filter(|id| {
+                    incoming.get(*id).map_or(true, |inc| {
+                        inc.iter().all(|from| state_layer.contains_key(from))
+                    })
+                })
+                .cloned()
+                .collect();
+
+            if layer_states.is_empty() {
+                for id in remaining.drain(..) {
+                    let idx = layers.len();
+                    state_layer.insert(id.clone(), idx);
+                    if layers.len() <= idx { layers.push(Vec::new()); }
+                    layers[idx].push(id);
+                }
+                break;
+            }
+
+            let idx = layers.len();
+            layers.push(layer_states.clone());
+            for id in &layer_states {
+                state_layer.insert(id.clone(), idx);
+                remaining.retain(|r| r != id);
+            }
+        }
+
+        // Calculate positions for this level
+        let mut max_x = 0.0_f32;
+        let mut max_y = 0.0_f32;
+
+        for (layer_idx, layer) in layers.iter().enumerate() {
+            // Calculate max width in this layer
+            let layer_max_width = layer.iter()
+                .map(|id| {
+                    if let Some(comp_size) = composite_sizes.get(id) {
+                        comp_size.x
+                    } else {
+                        state_widths.get(id).copied().unwrap_or(min_state_width)
+                    }
+                })
+                .fold(min_state_width, f32::max);
+
+            let x = start_pos.x + layer_idx as f32 * (layer_max_width + spacing_x) + layer_max_width / 2.0;
+            
+            // Calculate cumulative Y for states in this layer
+            let mut current_y = start_pos.y;
+            
+            for id in layer {
+                let state = states.iter().find(|s| s.id == *id).unwrap();
+                let (width, height) = if let Some(comp_size) = composite_sizes.get(id) {
+                    (comp_size.x, comp_size.y)
+                } else if state.is_start || state.is_end {
+                    (24.0, 24.0)
+                } else {
+                    (state_widths.get(id).copied().unwrap_or(min_state_width), state_height)
+                };
+
+                let center_y = current_y + height / 2.0;
+                let center = Pos2::new(x, center_y);
+                
+                layouts.insert(id.clone(), StateLayout {
+                    center,
+                    size: Vec2::new(width, height),
+                    bounds: Rect::from_center_size(center, Vec2::new(width, height)),
+                    is_composite: state.is_composite(),
+                });
+
+                // Reposition children inside composite
+                if state.is_composite() {
+                    let child_offset = Vec2::new(
+                        center.x - width / 2.0 + composite_padding,
+                        center.y - height / 2.0 + title_bar_height + composite_padding,
+                    );
+                    reposition_children(&state.children, child_offset, layouts);
+                }
+
+                current_y += height + spacing_y;
+                max_x = max_x.max(x + width / 2.0);
+                max_y = max_y.max(current_y - spacing_y);
+            }
+        }
+
+        Vec2::new(max_x - start_pos.x, max_y - start_pos.y)
+    }
+
+    /// Reposition children by an offset
+    fn reposition_children(
+        children: &[State],
+        offset: Vec2,
+        layouts: &mut HashMap<String, StateLayout>,
+    ) {
+        for child in children {
+            if let Some(layout) = layouts.get_mut(&child.id) {
+                layout.center = layout.center + offset;
+                layout.bounds = Rect::from_center_size(layout.center, layout.size);
+            }
+            reposition_children(&child.children, offset, layouts);
+        }
+    }
+
+    // Perform layout starting from margin
+    let total_size = layout_states(
+        &diagram.states,
+        &diagram.transitions,
+        &state_widths,
+        min_state_width,
+        state_height,
+        spacing_x,
+        spacing_y,
+        composite_padding,
+        title_bar_height,
+        Pos2::new(margin, margin),
+        &mut state_layouts,
+    );
+
+    let total_width = (total_size.x + margin * 2.0).max(300.0);
+    let total_height = (total_size.y + margin * 2.0).max(100.0);
+
     let (response, painter) = ui.allocate_painter(
-        Vec2::new(total_width.max(300.0), total_height.max(100.0)),
+        Vec2::new(total_width, total_height),
         egui::Sense::hover(),
     );
     let offset = response.rect.min.to_vec2();
 
-    // Draw transitions first (behind states)
-    for transition in &diagram.transitions {
-        if let (Some(&from_pos), Some(&to_pos)) = (state_pos.get(&transition.from), state_pos.get(&transition.to)) {
-            let from_state = diagram.states.iter().find(|s| s.id == transition.from);
-            let to_state = diagram.states.iter().find(|s| s.id == transition.to);
-            
-            let from_radius = if from_state.map(|s| s.is_start || s.is_end).unwrap_or(false) { 12.0 } else { state_width / 2.0 };
-            let to_radius = if to_state.map(|s| s.is_start || s.is_end).unwrap_or(false) { 12.0 } else { state_width / 2.0 };
-            
-            let from = from_pos + offset;
-            let to = to_pos + offset;
-            
-            let dir = (to - from).normalized();
-            let start = from + dir * from_radius;
-            let end = to - dir * to_radius;
-            
-            // Draw line
-            painter.line_segment([start, end], Stroke::new(1.5, arrow_color));
-            
-            // Draw arrow head
-            let arrow_size = 8.0;
-            let perp = Vec2::new(-dir.y, dir.x);
-            let arrow_left = end - dir * arrow_size + perp * (arrow_size * 0.4);
-            let arrow_right = end - dir * arrow_size - perp * (arrow_size * 0.4);
-            painter.add(egui::Shape::convex_polygon(
-                vec![end, arrow_left, arrow_right],
-                arrow_color,
-                Stroke::NONE,
-            ));
-            
-            // Draw label with background
-            if let Some(label) = &transition.label {
-                let mid = Pos2::new((start.x + end.x) / 2.0, (start.y + end.y) / 2.0);
-                let label_font_size = font_size - 2.0;
-                let label_width = label.len() as f32 * label_font_size * 0.6 + 12.0;
-                let label_height = label_font_size + 6.0;
-                let label_pos = mid - Vec2::new(0.0, 14.0);
-                let label_rect = Rect::from_center_size(label_pos, Vec2::new(label_width, label_height));
-                painter.rect_filled(label_rect, 3.0, label_bg);
-                painter.text(label_pos, egui::Align2::CENTER_CENTER, label, FontId::proportional(label_font_size), text_color);
+    // Draw function for states (recursive, draws composites as containers)
+    fn draw_states(
+        states: &[State],
+        layouts: &HashMap<String, StateLayout>,
+        painter: &egui::Painter,
+        offset: Vec2,
+        colors: &StateDiagramColors,
+        font_size: f32,
+        title_bar_height: f32,
+        dark_mode: bool,
+    ) {
+        for state in states {
+            if let Some(layout) = layouts.get(&state.id) {
+                let center = layout.center + offset;
+                let bounds = layout.bounds.translate(offset);
+
+                if state.is_start || state.is_end {
+                    // Draw start/end circles
+                    let radius = if state.is_start { 10.0 } else { 14.0 };
+                    painter.circle_filled(center, radius, if state.is_start { colors.start_color } else { colors.state_stroke });
+                    if state.is_end {
+                        painter.circle_filled(center, 7.0, if dark_mode { Color32::from_rgb(30, 35, 45) } else { Color32::WHITE });
+                    }
+                } else if state.is_composite() {
+                    // Draw composite state container
+                    // Outer rounded rectangle
+                    painter.rect(
+                        bounds,
+                        Rounding::same(10.0),
+                        colors.composite_fill,
+                        Stroke::new(2.0, colors.state_stroke),
+                    );
+                    
+                    // Title bar at top
+                    let title_rect = Rect::from_min_size(
+                        bounds.min,
+                        Vec2::new(bounds.width(), title_bar_height),
+                    );
+                    painter.rect(
+                        title_rect,
+                        Rounding { nw: 10.0, ne: 10.0, sw: 0.0, se: 0.0 },
+                        colors.composite_title_bg,
+                        Stroke::NONE,
+                    );
+                    
+                    // Title text
+                    let title_center = Pos2::new(title_rect.center().x, title_rect.center().y);
+                    painter.text(
+                        title_center,
+                        egui::Align2::CENTER_CENTER,
+                        &state.label,
+                        FontId::proportional(font_size),
+                        colors.text_color,
+                    );
+                    
+                    // Separator line under title
+                    painter.line_segment(
+                        [
+                            Pos2::new(bounds.min.x, bounds.min.y + title_bar_height),
+                            Pos2::new(bounds.max.x, bounds.min.y + title_bar_height),
+                        ],
+                        Stroke::new(1.0, colors.state_stroke),
+                    );
+
+                    // Recursively draw children
+                    draw_states(&state.children, layouts, painter, offset, colors, font_size, title_bar_height, dark_mode);
+                } else {
+                    // Draw simple state
+                    painter.rect(bounds, Rounding::same(8.0), colors.state_fill, Stroke::new(2.0, colors.state_stroke));
+                    painter.text(center, egui::Align2::CENTER_CENTER, &state.label, FontId::proportional(font_size), colors.text_color);
+                }
             }
         }
     }
 
-    // Draw states
-    for state in &diagram.states {
-        if let Some(&pos) = state_pos.get(&state.id) {
-            let center = pos + offset;
-            
-            if state.is_start || state.is_end {
-                let radius = if state.is_start { 10.0 } else { 14.0 };
-                painter.circle_filled(center, radius, if state.is_start { start_color } else { state_stroke });
-                if state.is_end {
-                    painter.circle_filled(center, 7.0, if dark_mode { Color32::from_rgb(30, 35, 45) } else { Color32::WHITE });
-                }
+    /// Compute the best anchor point on a state boundary for connecting to a target.
+    fn compute_anchor_point(
+        layout: &StateLayout,
+        target: Pos2,
+        offset: Vec2,
+        is_composite: bool,
+        header_height: f32,
+    ) -> Pos2 {
+        let center = layout.center + offset;
+        let bounds = layout.bounds.translate(offset);
+        
+        // For start/end states (small circles), use simple radial anchor
+        if layout.size.x == layout.size.y && layout.size.x < 30.0 {
+            let dir = (target - center).normalized();
+            return center + dir * 12.0;
+        }
+
+        // Determine which side of the bounds the target is on
+        let dx = target.x - center.x;
+        let dy = target.y - center.y;
+        let abs_dx = dx.abs();
+        let abs_dy = dy.abs();
+        
+        // Aspect ratio consideration
+        let half_w = layout.size.x / 2.0;
+        let half_h = layout.size.y / 2.0;
+        
+        // Determine dominant direction
+        if abs_dx / half_w > abs_dy / half_h {
+            // Horizontal - use left or right edge
+            if dx > 0.0 {
+                // Target is to the right
+                let y = center.y.max(bounds.min.y + if is_composite { header_height + 5.0 } else { 0.0 }).min(bounds.max.y - 5.0);
+                Pos2::new(bounds.max.x, y.clamp(bounds.min.y + 5.0, bounds.max.y - 5.0))
             } else {
-                let rect = Rect::from_center_size(center, Vec2::new(state_width, state_height));
-                painter.rect(rect, Rounding::same(8.0), state_fill, Stroke::new(2.0, state_stroke));
-                painter.text(center, egui::Align2::CENTER_CENTER, &state.label, FontId::proportional(font_size), text_color);
+                // Target is to the left
+                let y = center.y.max(bounds.min.y + if is_composite { header_height + 5.0 } else { 0.0 }).min(bounds.max.y - 5.0);
+                Pos2::new(bounds.min.x, y.clamp(bounds.min.y + 5.0, bounds.max.y - 5.0))
+            }
+        } else {
+            // Vertical - use top or bottom edge
+            if dy > 0.0 {
+                // Target is below
+                Pos2::new(center.x.clamp(bounds.min.x + 5.0, bounds.max.x - 5.0), bounds.max.y)
+            } else {
+                // Target is above - avoid header for composites
+                let min_y = if is_composite { bounds.min.y + header_height } else { bounds.min.y };
+                Pos2::new(center.x.clamp(bounds.min.x + 5.0, bounds.max.x - 5.0), min_y)
             }
         }
     }
+
+    // Draw function for transitions with support for different kinds
+    fn draw_transitions(
+        transitions: &[Transition],
+        layouts: &HashMap<String, StateLayout>,
+        transition_labels: &HashMap<(String, String), (String, Vec2)>,
+        painter: &egui::Painter,
+        offset: Vec2,
+        colors: &StateDiagramColors,
+        font_size: f32,
+        config: &StateDiagramConfig,
+    ) {
+        for trans in transitions {
+            if let (Some(from_layout), Some(to_layout)) = (layouts.get(&trans.from), layouts.get(&trans.to)) {
+                // Get arrow color based on transition kind
+                let arrow_color = colors.arrow_color_for_kind(trans.kind);
+                
+                // Compute anchor points
+                let from_center = from_layout.center + offset;
+                let to_center = to_layout.center + offset;
+                
+                let start = compute_anchor_point(
+                    from_layout, to_center, offset, from_layout.is_composite, config.header_height
+                );
+                let end = compute_anchor_point(
+                    to_layout, from_center, offset, to_layout.is_composite, config.header_height
+                );
+                
+                // For cross-hierarchy transitions, optionally use orthogonal routing
+                let use_orthogonal = config.orthogonal_cross_routing 
+                    && trans.kind == TransitionKind::CrossHierarchy;
+                
+                if use_orthogonal && (start.x - end.x).abs() > 20.0 && (start.y - end.y).abs() > 20.0 {
+                    // Draw orthogonal path with elbow
+                    let mid_x = (start.x + end.x) / 2.0;
+                    let elbow1 = Pos2::new(mid_x, start.y);
+                    let elbow2 = Pos2::new(mid_x, end.y);
+                    
+                    painter.line_segment([start, elbow1], Stroke::new(1.5, arrow_color));
+                    painter.line_segment([elbow1, elbow2], Stroke::new(1.5, arrow_color));
+                    painter.line_segment([elbow2, end], Stroke::new(1.5, arrow_color));
+                    
+                    // Arrow head at end
+                    let final_dir = (end - elbow2).normalized();
+                    let arrow_size = 8.0;
+                    let perp = Vec2::new(-final_dir.y, final_dir.x);
+                    let arrow_left = end - final_dir * arrow_size + perp * (arrow_size * 0.4);
+                    let arrow_right = end - final_dir * arrow_size - perp * (arrow_size * 0.4);
+                    painter.add(egui::Shape::convex_polygon(
+                        vec![end, arrow_left, arrow_right],
+                        arrow_color,
+                        Stroke::NONE,
+                    ));
+                    
+                    // Label at elbow midpoint
+                    if let Some((label_text, label_size)) = transition_labels.get(&(trans.from.clone(), trans.to.clone())) {
+                        let label_pos = Pos2::new(mid_x, (elbow1.y + elbow2.y) / 2.0);
+                        let label_rect = Rect::from_center_size(label_pos, *label_size);
+                        painter.rect_filled(label_rect, 3.0, colors.label_bg);
+                        painter.text(label_pos, egui::Align2::CENTER_CENTER, label_text, FontId::proportional(font_size - 2.0), colors.text_color);
+                    }
+                } else {
+                    // Draw straight line (default)
+                    let dir = (end - start).normalized();
+                    
+                    painter.line_segment([start, end], Stroke::new(1.5, arrow_color));
+                    
+                    // Draw arrow head
+                    let arrow_size = 8.0;
+                    let perp = Vec2::new(-dir.y, dir.x);
+                    let arrow_left = end - dir * arrow_size + perp * (arrow_size * 0.4);
+                    let arrow_right = end - dir * arrow_size - perp * (arrow_size * 0.4);
+                    painter.add(egui::Shape::convex_polygon(
+                        vec![end, arrow_left, arrow_right],
+                        arrow_color,
+                        Stroke::NONE,
+                    ));
+                    
+                    // Draw label with background
+                    if let Some((label_text, label_size)) = transition_labels.get(&(trans.from.clone(), trans.to.clone())) {
+                        let mid = Pos2::new((start.x + end.x) / 2.0, (start.y + end.y) / 2.0);
+                        let label_pos = mid - Vec2::new(0.0, 14.0);
+                        let label_rect = Rect::from_center_size(label_pos, *label_size);
+                        painter.rect_filled(label_rect, 3.0, colors.label_bg);
+                        painter.text(label_pos, egui::Align2::CENTER_CENTER, label_text, FontId::proportional(font_size - 2.0), colors.text_color);
+                    }
+                }
+            }
+        }
+    }
+
+    // Draw function for internal transitions (recursive)
+    fn draw_all_internal_transitions(
+        states: &[State],
+        layouts: &HashMap<String, StateLayout>,
+        transition_labels: &HashMap<(String, String), (String, Vec2)>,
+        painter: &egui::Painter,
+        offset: Vec2,
+        colors: &StateDiagramColors,
+        font_size: f32,
+        config: &StateDiagramConfig,
+    ) {
+        for state in states {
+            // Draw internal transitions
+            draw_transitions(&state.internal_transitions, layouts, transition_labels, painter, offset, colors, font_size, config);
+            // Recurse into children
+            draw_all_internal_transitions(&state.children, layouts, transition_labels, painter, offset, colors, font_size, config);
+        }
+    }
+
+    // Draw everything: states first, then transitions on top
+    draw_states(&diagram.states, &state_layouts, &painter, offset, &colors, font_size, title_bar_height, dark_mode);
+    draw_transitions(&diagram.transitions, &state_layouts, &transition_labels, &painter, offset, &colors, label_font_size, config);
+    draw_all_internal_transitions(&diagram.states, &state_layouts, &transition_labels, &painter, offset, &colors, label_font_size, config);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1821,25 +4535,50 @@ pub fn render_mindmap(
 
     let margin = 30.0_f32;
     let node_height = 28.0_f32;
-    let level_width = 140.0_f32;
+    let level_width = 160.0_f32; // Increased for wider nodes
     let vertical_spacing = 12.0_f32;
+    let node_padding = 24.0_f32;
+    let min_node_width = 60.0_f32;
+    let max_node_width = 180.0_f32; // Increased max width
+
+    // Pre-measure all node text widths
+    fn collect_texts(node: &MindmapNode, texts: &mut Vec<String>) {
+        texts.push(node.text.clone());
+        for child in &node.children {
+            collect_texts(child, texts);
+        }
+    }
+    let mut all_texts = Vec::new();
+    collect_texts(root, &mut all_texts);
+
+    let text_widths: HashMap<String, f32> = {
+        let text_measurer = EguiTextMeasurer::new(ui);
+        all_texts.into_iter()
+            .map(|text| {
+                let size = text_measurer.measure(&text, font_size);
+                let width = (size.width * 1.15 + node_padding).max(min_node_width).min(max_node_width);
+                (text, width)
+            })
+            .collect()
+    };
 
     // First pass: calculate layout WITHOUT drawing
     fn calc_layout(
         node: &MindmapNode,
         x: f32,
         y: &mut f32,
-        font_size: f32,
         node_height: f32,
         level_width: f32,
         vertical_spacing: f32,
+        text_widths: &HashMap<String, f32>,
+        min_node_width: f32,
     ) -> MindmapLayout {
-        let node_width = (node.text.len() as f32 * font_size * 0.5 + 24.0).max(60.0).min(130.0);
+        let node_width = text_widths.get(&node.text).copied().unwrap_or(min_node_width);
         
         // First, layout all children
         let mut children_layouts: Vec<MindmapLayout> = Vec::new();
         for child in &node.children {
-            let child_layout = calc_layout(child, x + level_width, y, font_size, node_height, level_width, vertical_spacing);
+            let child_layout = calc_layout(child, x + level_width, y, node_height, level_width, vertical_spacing, text_widths, min_node_width);
             children_layouts.push(child_layout);
         }
         
@@ -1864,7 +4603,7 @@ pub fn render_mindmap(
 
     // Calculate layout
     let mut y = margin;
-    let layout = calc_layout(root, margin, &mut y, font_size, node_height, level_width, vertical_spacing);
+    let layout = calc_layout(root, margin, &mut y, node_height, level_width, vertical_spacing, &text_widths, min_node_width);
 
     // Calculate total size from layout
     fn calc_bounds(layout: &MindmapLayout, node_height: f32) -> (f32, f32) {
@@ -2215,24 +4954,40 @@ pub fn render_class_diagram(
     let member_height = font_size + 4.0;
     let header_height = font_size + 10.0;
     let spacing = Vec2::new(60.0, 50.0);
+    let member_font_size = font_size - 2.0;
+    let text_width_factor = 1.15;
+    let name_padding = 24.0;
+    let member_padding = 24.0;
 
-    // Calculate class sizes
-    let mut class_sizes: HashMap<String, Vec2> = HashMap::new();
-    for class in &diagram.classes {
-        let name_width = class.name.len() as f32 * font_size * 0.55 + 20.0;
-        let max_member_width = class.attributes.iter()
-            .chain(class.methods.iter())
-            .map(|m| (m.name.len() + m.member_type.len() + 4) as f32 * (font_size - 2.0) * 0.5 + 20.0)
-            .fold(0.0_f32, f32::max);
-        
-        let width = name_width.max(max_member_width).max(class_min_width);
-        let height = header_height 
-            + (class.attributes.len().max(1) as f32 * member_height)
-            + (class.methods.len().max(1) as f32 * member_height)
-            + 10.0;
-        
-        class_sizes.insert(class.id.clone(), Vec2::new(width, height));
-    }
+    // Pre-measure class names and member text
+    let class_sizes: HashMap<String, Vec2> = {
+        let text_measurer = EguiTextMeasurer::new(ui);
+        diagram.classes.iter()
+            .map(|class| {
+                // Measure class name
+                let name_size = text_measurer.measure(&class.name, font_size);
+                let name_width = name_size.width * text_width_factor + name_padding;
+
+                // Measure all members (attributes and methods)
+                let max_member_width = class.attributes.iter()
+                    .chain(class.methods.iter())
+                    .map(|m| {
+                        let member_text = format!("{}: {}", m.name, m.member_type);
+                        let size = text_measurer.measure(&member_text, member_font_size);
+                        size.width * text_width_factor + member_padding
+                    })
+                    .fold(0.0_f32, f32::max);
+
+                let width = name_width.max(max_member_width).max(class_min_width);
+                let height = header_height
+                    + (class.attributes.len().max(1) as f32 * member_height)
+                    + (class.methods.len().max(1) as f32 * member_height)
+                    + 10.0;
+
+                (class.id.clone(), Vec2::new(width, height))
+            })
+            .collect()
+    };
 
     // Layout classes in grid
     let classes_per_row = 3.max((diagram.classes.len() as f32).sqrt().ceil() as usize);
@@ -2692,20 +5447,54 @@ pub fn render_er_diagram(
     let attr_height = font_size + 4.0;
     let header_height = font_size + 12.0;
     let spacing = Vec2::new(80.0, 60.0);
+    let attr_font_size = font_size - 2.0;
+    let text_width_factor = 1.15;
+    let name_padding = 30.0;
+    let attr_padding = 30.0;
+    let label_font_size = font_size - 2.0;
 
-    // Calculate entity sizes
-    let mut entity_sizes: HashMap<String, Vec2> = HashMap::new();
-    for entity in &diagram.entities {
-        let name_width = entity.name.len() as f32 * font_size * 0.6 + 30.0;
-        let max_attr_width = entity.attributes.iter()
-            .map(|a| (a.attr_type.len() + a.name.len() + 6) as f32 * (font_size - 2.0) * 0.5 + 30.0)
-            .fold(0.0_f32, f32::max);
-        
-        let width = name_width.max(max_attr_width).max(entity_min_width);
-        let height = header_height + entity.attributes.len().max(1) as f32 * attr_height + 10.0;
-        
-        entity_sizes.insert(entity.name.clone(), Vec2::new(width, height));
-    }
+    // Pre-measure entity sizes and relation labels
+    let entity_sizes: HashMap<String, Vec2> = {
+        let text_measurer = EguiTextMeasurer::new(ui);
+        diagram.entities.iter()
+            .map(|entity| {
+                // Measure entity name
+                let name_size = text_measurer.measure(&entity.name, font_size);
+                let name_width = name_size.width * text_width_factor + name_padding;
+
+                // Measure all attributes
+                let max_attr_width = entity.attributes.iter()
+                    .map(|a| {
+                        let attr_text = format!("{} {}", a.attr_type, a.name);
+                        let size = text_measurer.measure(&attr_text, attr_font_size);
+                        size.width * text_width_factor + attr_padding
+                    })
+                    .fold(0.0_f32, f32::max);
+
+                let width = name_width.max(max_attr_width).max(entity_min_width);
+                let height = header_height + entity.attributes.len().max(1) as f32 * attr_height + 10.0;
+
+                (entity.name.clone(), Vec2::new(width, height))
+            })
+            .collect()
+    };
+
+    // Pre-measure relation labels
+    let relation_labels: HashMap<usize, (String, Vec2)> = {
+        let text_measurer = EguiTextMeasurer::new(ui);
+        diagram.relations.iter().enumerate()
+            .filter_map(|(idx, rel)| {
+                rel.label.as_ref().map(|label| {
+                    let size = text_measurer.measure(label, label_font_size);
+                    let label_size = Vec2::new(
+                        size.width * text_width_factor + 16.0,
+                        size.height + 8.0,
+                    );
+                    (idx, (label.clone(), label_size))
+                })
+            })
+            .collect()
+    };
 
     // Layout entities
     let entities_per_row = 3.max((diagram.entities.len() as f32).sqrt().ceil() as usize);
@@ -2763,7 +5552,7 @@ pub fn render_er_diagram(
     let offset = response.rect.min.to_vec2();
 
     // Draw relations first
-    for relation in &diagram.relations {
+    for (rel_idx, relation) in diagram.relations.iter().enumerate() {
         if let (Some(&from_pos), Some(&to_pos)) = (entity_pos.get(&relation.from), entity_pos.get(&relation.to)) {
             let from_size = entity_sizes.get(&relation.from).copied().unwrap_or(Vec2::new(100.0, 80.0));
             let to_size = entity_sizes.get(&relation.to).copied().unwrap_or(Vec2::new(100.0, 80.0));
@@ -2792,14 +5581,13 @@ pub fn render_er_diagram(
             // To side marker
             draw_cardinality_marker(&painter, end, -dir, -perp, &relation.to_cardinality, marker_size, line_color);
             
-            // Draw label
-            if let Some(label) = &relation.label {
+            // Draw label using pre-measured size
+            if let Some((label_text, label_size)) = relation_labels.get(&rel_idx) {
                 let mid = Pos2::new((start.x + end.x) / 2.0, (start.y + end.y) / 2.0);
                 let label_bg = if dark_mode { Color32::from_rgb(35, 40, 50) } else { Color32::from_rgb(255, 255, 255) };
-                let label_width = label.len() as f32 * (font_size - 2.0) * 0.5 + 10.0;
-                let label_rect = Rect::from_center_size(mid, Vec2::new(label_width, font_size + 4.0));
+                let label_rect = Rect::from_center_size(mid, *label_size);
                 painter.rect_filled(label_rect, 2.0, label_bg);
-                painter.text(mid, egui::Align2::CENTER_CENTER, label, FontId::proportional(font_size - 2.0), text_color);
+                painter.text(mid, egui::Align2::CENTER_CENTER, label_text, FontId::proportional(label_font_size), text_color);
             }
         }
     }
@@ -3905,20 +6693,12 @@ pub fn render_user_journey(
                 text_color,
             );
 
-            // Draw score indicator (emoji face)
-            let face = match task.score {
-                1 => "😫",
-                2 => "😕",
-                3 => "😐",
-                4 => "🙂",
-                _ => "😊",
-            };
-            painter.text(
+            // Draw score indicator (filled circle - size reflects score)
+            let indicator_radius = 4.0 + task.score as f32 * 1.0; // 5-9 radius based on score
+            painter.circle_filled(
                 Pos2::new(x, task_y + 12.0),
-                egui::Align2::CENTER_CENTER,
-                face,
-                FontId::proportional(font_size),
-                text_color,
+                indicator_radius,
+                color,
             );
 
             // Draw actors below
@@ -4000,7 +6780,8 @@ pub fn render_mermaid_diagram(
                 } else {
                     FlowchartColors::light()
                 };
-                let layout = layout_flowchart(&flowchart, ui.available_width(), font_size);
+                let text_measurer = EguiTextMeasurer::new(ui);
+                let layout = layout_flowchart(&flowchart, ui.available_width(), font_size, &text_measurer);
                 render_flowchart(ui, &flowchart, &layout, &colors, font_size);
                 RenderResult::Success
             }
@@ -4163,15 +6944,50 @@ mod tests {
     fn test_layout_produces_valid_positions() {
         let source = "flowchart TD\n  A[Start] --> B[End]";
         let flowchart = parse_flowchart(source).unwrap();
-        let layout = layout_flowchart(&flowchart, 400.0, 14.0);
-        
+        let text_measurer = EstimatedTextMeasurer::new();
+        let layout = layout_flowchart(&flowchart, 400.0, 14.0, &text_measurer);
+
         assert_eq!(layout.nodes.len(), 2);
         assert!(layout.nodes.contains_key("A"));
         assert!(layout.nodes.contains_key("B"));
-        
+
         // In TD layout, B should be below A
         let a_pos = layout.nodes.get("A").unwrap().pos;
         let b_pos = layout.nodes.get("B").unwrap().pos;
         assert!(b_pos.y > a_pos.y);
+    }
+
+    #[test]
+    fn test_text_measurer_trait() {
+        let measurer = EstimatedTextMeasurer::new();
+
+        // Test basic measurement
+        let size = measurer.measure("Hello", 14.0);
+        assert!(size.width > 0.0);
+        assert!(size.height > 0.0);
+
+        // Longer text should have greater width
+        let size_longer = measurer.measure("Hello World", 14.0);
+        assert!(size_longer.width > size.width);
+
+        // Test row height
+        let row_height = measurer.row_height(14.0);
+        assert!(row_height > 0.0);
+    }
+
+    #[test]
+    fn test_truncate_with_ellipsis() {
+        let measurer = EstimatedTextMeasurer::new();
+
+        // Text that fits should not be truncated
+        let short_text = "Hi";
+        let result = measurer.truncate_with_ellipsis(short_text, 14.0, 100.0);
+        assert_eq!(result, short_text);
+
+        // Long text should be truncated
+        let long_text = "This is a very long label that should be truncated";
+        let result = measurer.truncate_with_ellipsis(long_text, 14.0, 50.0);
+        assert!(result.len() < long_text.len());
+        assert!(result.ends_with('…'));
     }
 }

@@ -44,7 +44,7 @@ Native rendering of 11 diagram types directly in the preview:
 - Flowchart, Sequence, Pie, State, Mindmap
 - Class, ER, Git Graph, Gantt, Timeline, User Journey
 
-> 📦 **v0.2.1 Coming Soon:** Enhanced Mermaid support with sequence control-flow blocks (`loop`, `alt`, `opt`, `par`), improved text sizing, flowchart subgraphs, and more. See [ROADMAP.md](ROADMAP.md) for details.
+> ✨ **v0.2.1 Released:** Enhanced Mermaid support with sequence control-flow blocks (`loop`, `alt`, `opt`, `par`), activation boxes, notes, flowchart subgraphs with branching layout, and composite/nested states. See [CHANGELOG.md](CHANGELOG.md) for full details.
 
 ### Workspace Features
 - **Workspace Mode** - Open folders with file tree, quick switcher (Ctrl+P), and search-in-files (Ctrl+Shift+F)

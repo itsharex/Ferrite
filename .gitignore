@@ -43,6 +43,24 @@ desktop.ini
 *.pem
 *.key
 
+# AI agent configurations and instructions
+.mcp.json
+.rules
+opencode.json
+AGENT.md
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+.clinerules/
+.gemini/
+.kilo/
+.kiro/
+.roo/
+.trae/
+.windsurf/
+.zed/
+.github/instructions/
+
 # Logs
 logs/
 *.log
@@ -81,3 +99,15 @@ temp/
 # Test artifacts
 *.test
 test-output/
+
+logs
+# Dependency directories
+# Environment variables
+# Editor directories and files
+.idea
+.vscode
+# OS specific
+
+# Task files
+# tasks.json
+# tasks/ 

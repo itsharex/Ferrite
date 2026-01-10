@@ -12,67 +12,49 @@ These issues cannot be fixed without replacing egui's built-in text editor:
 
 ## Planned Features 🚀
 
-### v0.2.1 (In Progress) - Mermaid Diagram Improvements
+### v0.3.0 (Planned) - Mermaid Crate + Editor Improvements
 
-> **Status:** Active development  
-> **Focus:** Polish and complete native Mermaid diagram rendering
+> **Status:** Planning  
+> **Docs:** [Mermaid Crate Plan](docs/mermaid-crate-plan.md) | [Custom Editor Plan](docs/technical/custom-editor-widget-plan.md) | [Modular Refactor Plan](docs/refactor.md)
 
-This patch release focuses on improving the native Mermaid diagram renderer added in v0.2.0:
+v0.3.0 focuses on extracting the Mermaid renderer as a standalone crate and continuing diagram improvements.
 
-#### Text & Layout Fixes
-- [x] **Accurate text measurement** - Replace character-count estimation with egui font metrics
-- [x] **Dynamic node sizing** - Nodes resize to fit their labels without clipping
-- [x] **Text overflow handling** - Edge labels truncate with ellipsis when too long
-- [x] **User Journey icons** - Fixed unsupported emoji rendering
+#### 1. Mermaid Crate Extraction
+Extract Ferrite's native Mermaid renderer (~6000 lines) into a standalone pure-Rust crate.
 
-#### Sequence Diagram Enhancements
-- [x] **Control-flow blocks** - Support for `loop`, `alt`, `opt`, `par` blocks with nesting
-- [ ] **Activation boxes** - `activate`/`deactivate` markers on lifelines
-- [ ] **Notes** - `Note left/right/over` syntax support
+- [ ] **Standalone crate** - Backend-agnostic architecture with SVG, PNG, and egui outputs
+- [ ] **Public API** - `parse()`, `layout()`, `render()` pipeline
+- [ ] **SVG export** - Generate valid SVG files from diagrams
+- [ ] **PNG export** - Rasterize via resvg
+- [ ] **WASM compatible** - SVG backend works in browsers
 
-#### Flowchart Improvements
-- [ ] **Proper branching layout** - Fix single-column rendering, implement multi-path layout
-- [ ] **Subgraph support** - Nested subgraphs with direction overrides
+#### 2. Mermaid Diagram Improvements
+Continue improving diagram rendering quality:
 
-#### State Diagram Enhancements
-- [ ] **Composite states** - Nested state machines
-- [ ] **Advanced transitions** - Fork/join, choice pseudostates
+##### Git Graph (Major Rewrite)
+- [ ] **Horizontal timeline layout** - Left-to-right commit flow like Mermaid
+- [ ] **Branch lanes** - Distinct horizontal lanes per branch with colored labels
+- [ ] **Merge visualization** - Curved paths connecting branches
+- [ ] **Tags and highlights** - Visual markers on commits
 
----
+##### Flowchart
+- [ ] **More node shapes** - Parallelogram, trapezoid, double-circle, etc.
+- [ ] **Styling syntax** - `style` and `classDef` directives
 
-### v0.3.0 (Planned) - Custom Editor + Modular Architecture
+##### State Diagram
+- [ ] **Fork/join pseudostates** - Parallel regions
+- [ ] **History states** - Shallow (H) and deep (H*) history
 
-> **Status:** Collecting v0.2.0 feedback before implementation  
-> **Docs:** [Custom Editor Plan](docs/technical/custom-editor-widget-plan.md) | [Modular Refactor Plan](docs/refactor.md)
-
-v0.3.0 is a foundational release with two major architectural changes:
-
-#### 1. Custom Editor Widget
+#### 3. Custom Editor Widget (Stretch Goal)
 Replace egui's `TextEdit` with a custom `FerriteEditor` widget to unblock advanced editing features.
 
 - [ ] **FerriteEditor widget** - Custom text editor using egui drawing primitives
 - [ ] **Rope-based buffer** - Efficient text storage via `ropey` crate
-- [ ] **Full input handling** - Direct keyboard/mouse event processing
 - [ ] **Full multi-cursor editing** - Text operations at all cursor positions
 - [ ] **Code folding with text hiding** - Actually collapse regions visually
-- [ ] **Perfect scroll sync** - Direct line-to-pixel mapping access
 
-#### 2. Modular Architecture Refactor
-Transform Ferrite from monolithic to "Core + Features" using Rust's compile-time feature flags.
-
-- [ ] **Feature-gated dependencies** - `markdown`, `json`, `yaml`, `syntax_highlighting`, `git` as optional
-- [ ] **DocumentView enum** - Type-safe file handling with `#[cfg(feature)]` variants
-- [ ] **Feature switchboard** - Central file-type detection with graceful fallback to plain text
-- [ ] **Directory restructure** - Move specialized code to `src/features/` module
-
-**Benefits:**
-- Compile minimal builds (`cargo build --no-default-features`)
-- Faster dev cycles (disable unused features)
-- Smaller binaries for users who don't need all formats
-- Future WASM compatibility
-
-#### Additional v0.3.0 Goals
-- [ ] **Split view preview editing** - Make edits in preview persist
+#### Platform & Distribution
+- [ ] **macOS app signing & notarization** - Create proper `.app` bundle, sign with Developer ID, notarize with Apple
 
 ### Future (v0.4.0+)
 - [ ] Spell checking
@@ -80,11 +62,46 @@ Transform Ferrite from monolithic to "Core + Features" using Rust's compile-time
 - [ ] Virtual/ghost text (AI completions, etc.)
 - [ ] Column/box selection
 
+### Long-Term Vision
+
+#### Headless Editor Library
+Extract `FerriteEditor` as a standalone, framework-agnostic text editing library for the Rust ecosystem.
+
+> **Context:** There's currently no general-purpose "headless" code editor library in Rust. Existing implementations (egui's TextEdit, Lapce/Floem, Zed/gpui) are tightly coupled to their UI frameworks. The v0.3.0 custom editor and modular architecture lay the groundwork for potential extraction.
+
+**Prerequisites (from v0.3.0):**
+- Custom `FerriteEditor` widget with rope-based buffer
+- Modular architecture with clean separation of concerns
+- Framework-agnostic core logic
+
+**Extraction would involve:**
+- [ ] Abstract rendering backend (trait-based: egui, wgpu, vello, SVG, etc.)
+- [ ] Framework-agnostic input handling
+- [ ] Standalone crate with minimal dependencies
+- [ ] Integration with [Parley](https://github.com/linebender/parley) for advanced text layout/shaping (optional)
+
 ---
 
 ## Completed ✅
 
-### v0.2.0 (Current Release)
+### v0.2.1 (Current Release)
+
+#### Mermaid Diagram Enhancements
+- [x] **Accurate text measurement** - Replace character-count estimation with egui font metrics
+- [x] **Dynamic node sizing** - Nodes resize to fit their labels without clipping
+- [x] **Text overflow handling** - Edge labels truncate with ellipsis when too long
+- [x] **User Journey icons** - Fixed unsupported emoji rendering with text fallbacks
+- [x] **Sequence control-flow blocks** - Support for `loop`, `alt`, `opt`, `par`, `critical`, `break` blocks with nesting
+- [x] **Sequence activation boxes** - `activate`/`deactivate` markers and `+`/`-` shorthand on lifelines
+- [x] **Sequence notes** - `Note left/right/over` syntax support with dog-ear rendering
+- [x] **Flowchart branching layout** - Sugiyama-style layered graph with side-by-side branches
+- [x] **Flowchart subgraphs** - Nested `subgraph`/`end` blocks with direction overrides
+- [x] **Back-edge routing** - Cycle edges rendered with smooth bezier curves
+- [x] **Smart edge exit points** - Decision node edges exit from different points to prevent crossing
+- [x] **Composite/nested states** - `state Parent { ... }` syntax with recursive nesting
+- [x] **Advanced state transitions** - Color-coded transitions and smart anchor points
+
+### v0.2.0
 
 #### Major Features
 - [x] **Side-by-side split view** - Raw editor on left, rendered preview on right with resizable divider

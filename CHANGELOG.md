@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2025-01-10
+
+### Added
+
+#### Mermaid Diagram Enhancements
+- **Sequence Diagram Control Blocks** - Full support for `loop`, `alt`, `opt`, `par`, `critical`, `break` blocks with proper nesting and colored labels
+- **Sequence Activation Boxes** - `activate`/`deactivate` commands and `+`/`-` shorthand on messages for lifeline activation tracking
+- **Sequence Notes** - `Note left/right/over` syntax with dog-ear corner rendering
+- **Flowchart Subgraphs** - Nested `subgraph`/`end` blocks with semi-transparent backgrounds and direction overrides
+- **Composite/Nested States** - State diagrams now support `state Parent { ... }` syntax with recursive nesting
+- **Advanced State Transitions** - Color-coded transitions, smart anchor points, and cross-nesting-level edge routing
+
+#### Layout Improvements
+- **Flowchart Branching** - Sugiyama-style layered graph layout with proper side-by-side branch placement
+- **Cycle Detection** - Back-edges rendered with smooth bezier curves instead of crossing lines
+- **Smart Edge Routing** - Decision node edges exit from different points to prevent crossing
+- **Edge Declaration Order** - Branch ordering now matches Mermaid's convention (later-declared edges go left)
+
+### Fixed
+- **Text Measurement** - Replaced character-count estimation with egui font metrics for accurate node sizing
+- **Node Overflow** - Nodes dynamically resize to fit their labels without clipping
+- **Edge Labels** - Long labels truncate with ellipsis instead of overflowing
+- **User Journey Icons** - Fixed unsupported emoji rendering with text fallbacks
+
+### Technical
+- Extended `mermaid.rs` from ~4000 to ~6000+ lines
+- Added technical documentation for all new features in `docs/technical/`
+
 ## [0.2.0] - 2025-01-09
 
 ### Added
@@ -114,9 +142,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Version History
 
+- **0.2.1** - Mermaid diagram improvements (control blocks, subgraphs, nested states, improved layout)
 - **0.2.0** - Major feature release (Split View, Mermaid, Minimap, Git integration, and more)
 - **0.1.0** - Initial public release
 
-[Unreleased]: https://github.com/OlaProeis/Ferrite/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/OlaProeis/Ferrite/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/OlaProeis/Ferrite/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/OlaProeis/Ferrite/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/OlaProeis/Ferrite/releases/tag/v0.1.0
