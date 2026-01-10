@@ -12,6 +12,34 @@ These issues cannot be fixed without replacing egui's built-in text editor:
 
 ## Planned Features 🚀
 
+### v0.2.1 (In Progress) - Mermaid Diagram Improvements
+
+> **Status:** Active development  
+> **Focus:** Polish and complete native Mermaid diagram rendering
+
+This patch release focuses on improving the native Mermaid diagram renderer added in v0.2.0:
+
+#### Text & Layout Fixes
+- [x] **Accurate text measurement** - Replace character-count estimation with egui font metrics
+- [x] **Dynamic node sizing** - Nodes resize to fit their labels without clipping
+- [x] **Text overflow handling** - Edge labels truncate with ellipsis when too long
+- [x] **User Journey icons** - Fixed unsupported emoji rendering
+
+#### Sequence Diagram Enhancements
+- [x] **Control-flow blocks** - Support for `loop`, `alt`, `opt`, `par` blocks with nesting
+- [ ] **Activation boxes** - `activate`/`deactivate` markers on lifelines
+- [ ] **Notes** - `Note left/right/over` syntax support
+
+#### Flowchart Improvements
+- [ ] **Proper branching layout** - Fix single-column rendering, implement multi-path layout
+- [ ] **Subgraph support** - Nested subgraphs with direction overrides
+
+#### State Diagram Enhancements
+- [ ] **Composite states** - Nested state machines
+- [ ] **Advanced transitions** - Fork/join, choice pseudostates
+
+---
+
 ### v0.3.0 (Planned) - Custom Editor + Modular Architecture
 
 > **Status:** Collecting v0.2.0 feedback before implementation  
@@ -45,7 +73,6 @@ Transform Ferrite from monolithic to "Core + Features" using Rust's compile-time
 
 #### Additional v0.3.0 Goals
 - [ ] **Split view preview editing** - Make edits in preview persist
-- [ ] **Mermaid improvements** - Performance, subgraph support, error recovery
 
 ### Future (v0.4.0+)
 - [ ] Spell checking
